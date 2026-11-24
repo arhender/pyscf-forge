@@ -25,10 +25,13 @@ rigid shift applied separately to occupied and virtual orbitals:
 
     eps_p^QP = eps_p^MF + Delta_q
 
-where q is the computed orbital of the same kind (occupied / virtual) closest in index to p.
-For the usual contiguous window around the gap this means every occupied orbital below the
-window receives the correction of the lowest computed occupied orbital and every virtual
-above the window receives the correction of the highest computed virtual orbital.
+where q is the computed orbital of the same kind (occupied / virtual) closest in mean-field
+energy to p.  For the usual contiguous window around the gap this means every occupied
+orbital below the window receives the correction of the lowest computed occupied orbital and
+every virtual above the window receives the correction of the highest computed virtual
+orbital.  For non-contiguous windows (e.g. a core level plus a valence window) each orbital
+takes the correction of the energetically closest computed orbital, so valence orbitals are
+not shifted by a core correction.
 '''
 
 import numpy as np
@@ -68,22 +71,33 @@ def scissor_shift(gw, orbs=None, mo_energy_qp=None, mo_energy_mf=None, mo_occ=No
     if getattr(gw, 'frozen', None) is not None:
         raise NotImplementedError('scissor_shift does not support frozen orbitals.')
 
+    mo_energy = scissor_shift_energies(mo_energy_qp, mo_energy_mf, mo_occ, orbs,
+                                       log=logger.new_logger(gw))
+    if inplace:
+        gw.mo_energy = mo_energy
+    return mo_energy
+
+
+def scissor_shift_energies(mo_energy_qp, mo_energy_mf, mo_occ, orbs=None, log=None):
+    '''Array-level scissor shift (see scissor_shift).
+
+    Orbitals in `orbs` take their values from mo_energy_qp; every other occupied (virtual)
+    orbital is shifted by the correction mo_energy_qp - mo_energy_mf of the computed occupied
+    (virtual) orbital closest in mean-field energy.  All arrays refer to the same orbital space, which may
+    be a frozen-core subspace.
+    '''
+    mo_energy_qp = np.asarray(mo_energy_qp, dtype=float)
+    mo_energy_mf = np.asarray(mo_energy_mf, dtype=float)
     nmo = mo_energy_mf.size
     if orbs is None:
         orbs = range(nmo)
     orbs = np.unique(np.asarray(list(orbs), dtype=int))
-    occ = mo_occ > 0
+    occ = np.asarray(mo_occ) > 0
     computed = np.zeros(nmo, dtype=bool)
     computed[orbs] = True
 
     mo_energy = mo_energy_mf.copy()
     mo_energy[computed] = mo_energy_qp[computed]
-    if computed.all():
-        if inplace:
-            gw.mo_energy = mo_energy
-        return mo_energy
-
-    log = logger.new_logger(gw)
     corr = mo_energy_qp - mo_energy_mf
     for kind, mask in (('occupied', occ), ('virtual', ~occ)):
         ref = np.where(computed & mask)[0]
@@ -93,12 +107,10 @@ def scissor_shift(gw, orbs=None, mo_energy_qp=None, mo_energy_mf=None, mo_occ=No
         if ref.size == 0:
             raise RuntimeError('No %s orbital was corrected by GW; cannot shift the %s orbitals. '
                                'Include at least one %s orbital in gw.orbs.' % (kind, kind, kind))
-        nearest = ref[np.abs(todo[:, None] - ref[None, :]).argmin(axis=1)]
+        nearest = ref[np.abs(mo_energy_mf[todo][:, None] - mo_energy_mf[ref][None, :]).argmin(axis=1)]
         mo_energy[todo] = mo_energy_mf[todo] + corr[nearest]
-        for q in np.unique(nearest):
-            log.info('scissor shift: %d %s orbital(s) shifted by %.6f Ha (correction of orbital %d)',
-                     np.count_nonzero(nearest == q), kind, corr[q], q)
-
-    if inplace:
-        gw.mo_energy = mo_energy
+        if log is not None:
+            for q in np.unique(nearest):
+                log.info('scissor shift: %d %s orbital(s) shifted by %.6f Ha (correction of orbital %d)',
+                         np.count_nonzero(nearest == q), kind, corr[q], q)
     return mo_energy
