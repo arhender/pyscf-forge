@@ -119,6 +119,45 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(errs[0] / errs[1], 10, 0)
         self.assertTrue(np.all(delta['linear'] >= 0))
 
+    def test_tpa_nondegenerate(self):
+        mf = _run_mf('PBE0')
+        qr = QRTDDFT(mf)
+        qr.solver = 'direct'
+        exci, T_deg, d_deg = qr.two_photon_absorption(nstates=4)
+
+        # explicit equal pairs (or (None, None)) reproduce the degenerate default
+        _, T, _ = qr.two_photon_absorption(nstates=4, frequencies=[(w / 2, w / 2) for w in exci])
+        self.assertAlmostEqual(abs(T - T_deg).max(), 0, 9)
+        _, T, _ = qr.two_photon_absorption(nstates=4, frequencies=(None, None))
+        self.assertAlmostEqual(abs(T - T_deg).max(), 0, 9)
+
+        # fixed photon w1 for every state; T_BC(w1, w2) = T_CB(w2, w1)
+        w1 = 0.1
+        _, T12, d12 = qr.two_photon_absorption(nstates=4, frequencies=(w1, None))
+        self.assertAlmostEqual(abs(qr.tpa_frequencies.sum(axis=1) - exci).max(), 0, 12)
+        _, T21, d21 = qr.two_photon_absorption(nstates=4, frequencies=(None, w1))
+        self.assertAlmostEqual(abs(T12 - T21.transpose(0, 2, 1)).max(), 0, 9)
+        self.assertAlmostEqual(abs(d12['linear'] - d21['linear']).max(), 0, 12)
+        self.assertAlmostEqual(abs(d12['circular'] - d21['circular']).max(), 0, 12)
+        self.assertTrue(np.all(d12['linear'] >= 0))
+        self.assertGreater(abs(T12 - T_deg).max(), 1e-3)
+
+        # residue of the quadratic response function at w1 + w2 -> Omega_N with w1 fixed
+        r = qr.get_dipole_mo()
+        tdm = qr.transition_dipole()
+        n = int(np.argmax(np.abs(tdm).max(axis=1) * np.abs(T12).reshape(4, -1).max(axis=1)))
+        ref = np.einsum('x,yz->xyz', tdm[n], T12[n])
+        errs = [abs(-d * qr.quadratic_response(r, r, r, w1, exci[n] - w1 - d) - ref).max()
+                for d in (1e-4, 1e-5)]
+        self.assertLess(errs[1], 2e-3 * abs(ref).max())
+        self.assertAlmostEqual(errs[0] / errs[1], 10, 0)
+
+        # inconsistent pairs are rejected
+        with self.assertRaises(ValueError):
+            qr.two_photon_absorption(nstates=4, frequencies=(0.1, 0.1))
+        with self.assertRaises(ValueError):
+            qr.two_photon_absorption(nstates=4, frequencies=[(0.1, None)] * 3)
+
     def test_tdhf_matches_bse_qr(self):
         try:
             from pyscf.gw.bse_qr import QRBSE
