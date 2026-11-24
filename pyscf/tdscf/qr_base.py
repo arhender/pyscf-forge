@@ -15,19 +15,20 @@
 #
 
 '''
-Shared machinery for linear and quadratic response of restricted, closed-shell, real-orbital
-time-dependent mean-field-like theories (TDHF, adiabatic TDDFT, static-screened BSE).
+Shared machinery for linear, quadratic and cubic response of restricted, closed-shell,
+real-orbital time-dependent mean-field-like theories (TDHF, adiabatic TDDFT, static-screened BSE).
 
 All such theories share the density-matrix equation of motion i dD/dt = [F, D] with
 idempotency D^2 = D (per-spin density, D0 = occupied projector) and
 
-    F[D] = F0 + V(t) + G[D - D0] + (second-order kernel terms),
+    F[D] = F0 + V(t) + G[D - D0] + 1/2 g[D - D0, D - D0] + 1/6 h[D - D0, D - D0, D - D0],
 
 where F0 = diag(eps) (Kohn-Sham, Hartree-Fock or GW quasiparticle energies) and G is the
-method-specific kernel.  Subclasses provide G (get_kernel) and, optionally, additional
-second-order terms (_second_order_kernel, e.g. the XC hyperkernel), faster matrix-vector
-products (_lr_matvec), dense matrices (get_dense_apb_amb) and an excited-state solver for
-large problems (_excited_states_large).
+method-specific kernel.  Subclasses provide G (get_kernel) and, optionally, the hyperkernel g
+(_hyperkernel, e.g. the XC hyperkernel) and the third-order kernel h (_third_kernel, e.g. the
+fourth functional derivative of E_xc), faster matrix-vector products (_lr_matvec), dense
+matrices (get_dense_apb_amb) and an excited-state solver for large problems
+(_excited_states_large).
 
 First order (operator V at frequency w):
     (A - w) X + B Y = -V_ai,      B X + (A + w) Y = -V_ia,
@@ -35,17 +36,40 @@ First order (operator V at frequency w):
 Second order (B at w1, C at w2, w = w1 + w2):
     K_ij = -sum_a (Y^B_ia X^C_ja + Y^C_ia X^B_ja),   K_ab = sum_i (X^B_ia Y^C_ib + X^C_ia Y^B_ib)
     Comm = [F1^B, D1^C] + [F1^C, D1^B]
-    r_ai = Comm_ai + G2_ai,   r_ia = -Comm_ia + G2_ia,   G2 = G[K] (+ hyperkernel terms)
+    r_ai = Comm_ai + G2_ai,   r_ia = -Comm_ia + G2_ia,   G2 = G[K] + g[D1^B, D1^C]
+    D2^BC = K + (X^BC, Y^BC) from the linear equations at w1 + w2,
+    F2^BC = G[D2^BC] + g[D1^B, D1^C]                       (no V at second order)
 Quadratic response function (2n+1 form):
     <<A; B, C>>_{w1,w2} = 2 [ Tr(A K) + z_A(w1 + w2) . r^BC ]
 Two-photon transition tensor (single residue):
     T^N_BC = sqrt(2) z_N . r^BC(w1, w2),  w1 + w2 = Omega_N,  X_N.X_N - Y_N.Y_N = 1.
 
-Conventions: H' = F . r, Taylor convention mu(F) = mu0 + alpha F + 1/2 beta F F, i.e.
-alpha_xy = -<<r_x; r_y>>, beta_xyz(-w1-w2; w1, w2) = -<<r_x; r_y, r_z>>.
+Third order (B at w1, C at w2, D at w3, ws = w1 + w2 + w3; the sums run over the three
+pairings X|YZ = B|CD, C|BD, D|BC):
+    S3 = sum (D1^X D2^YZ + D2^YZ D1^X),   K3_oo = -S3_oo,   K3_vv = S3_vv   (idempotency;
+         the ov block of S3 cancels in the sum)
+    Comm3 = sum ([F1^X, D2^YZ] + [F2^YZ, D1^X])
+    G3 = G[K3] + sum g[D1^X, D2^YZ] + h[D1^B, D1^C, D1^D]
+    r3_ai = Comm3_ai + G3_ai,   r3_ia = -Comm3_ia + G3_ia
+Cubic response function (2n+2 form; second-order but no third-order equations are solved):
+    <<A; B, C, D>>_{w1,w2,w3} = 2 [ Tr(A K3) + z_A(ws) . r3^BCD ]
+Three-photon transition tensor (single residue; K3 has no pole at ws = Omega_N):
+    T^N_BCD = sqrt(2) z_N . r3^BCD(w1, w2, w3),  w1 + w2 + w3 = Omega_N.
 
-See pyscf.tdscf.quadratic_response (TDHF/TDDFT) and pyscf.gw.bse_qr (BSE) for references.
+Conventions: H' = F . r, Taylor convention
+mu(F) = mu0 + alpha F + 1/2 beta F F + 1/6 gamma F F F, i.e.
+alpha_xy = -<<r_x; r_y>>, beta_xyz(-w1-w2; w1, w2) = -<<r_x; r_y, r_z>>,
+gamma_xyzw(-ws; w1, w2, w3) = -<<r_x; r_y, r_z, r_w>>.
+
+References for cubic response: B. Jansik, P. Salek, D. Jonsson, O. Vahtras, H. Agren,
+J. Chem. Phys. 122, 054107 (2005) (TDDFT cubic response); A. J. Thorvaldsen et al.,
+J. Chem. Phys. 129, 214108 (2008) (density-matrix formulation, 2n+1/2n+2 rules);
+E. Cronstrand, P. Norman, Y. Luo, H. Agren, J. Chem. Phys. 121, 2020 (2004) (three-photon
+absorption from the cubic response residue).
+See pyscf.tdscf.quadratic_response (TDHF/TDDFT) and pyscf.gw.bse_qr (BSE) for the other references.
 '''
+
+import itertools
 
 import numpy as np
 import scipy.linalg
@@ -110,6 +134,10 @@ class QuadraticResponseBase(lib.StreamObject):
         self.tpa_tensor = None
         self.tpa_strength = None
         self.tpa_frequencies = None
+        self.gamma = None
+        self.tpa3_tensor = None
+        self.tpa3_strength = None
+        self.tpa3_frequencies = None
 
     # ------------------------------------------------------------------ setup
 
@@ -145,9 +173,20 @@ class QuadraticResponseBase(lib.StreamObject):
         possibly non-symmetric density matrices.'''
         raise NotImplementedError
 
+    def _hyperkernel(self, Db, Dc):
+        '''Hyperkernel g[Db, Dc] (MO basis) for per-spin, possibly non-symmetric densities,
+        or None if the method has none.'''
+        return None
+
+    def _third_kernel(self, Db, Dc, Dd):
+        '''Third-order kernel h[Db, Dc, Dd] (MO basis), or None if the method has none.'''
+        return None
+
     def _second_order_kernel(self, K, D1b, D1c):
         '''Kernel terms of the second-order Fock matrix: G[K] plus any hyperkernel contribution.'''
-        return self.get_kernel(K)
+        G2 = self.get_kernel(K)
+        g = self._hyperkernel(D1b, D1c)
+        return G2 if g is None else G2 + g
 
     def _lr_matvec(self, omega, X, Y):
         '''Apply [[A - w, B], [B, A + w]] to (X, Y), each of shape (nocc, nvir).'''
@@ -363,6 +402,134 @@ class QuadraticResponseBase(lib.StreamObject):
                 qr[:, ib, ic] = 2.0 * (trAK + zr)
         return qr
 
+    def second_order(self, resp_b, resp_c, pairs):
+        '''Second-order densities and Fock matrices for perturbation pairs.
+
+        pairs is a list of component indices (ib, ic) of resp_b (at w1) and resp_c (at w2).
+        All second-order linear equations at w1 + w2 are solved together.  Returns a list of
+        (D2, F2) with D2 = K + (X^BC, Y^BC) and F2 = G[D2] + g[D1^B, D1^C] (no V term).
+        '''
+        if not pairs:
+            return []
+        rhs = [self.second_order_rhs(resp_b, resp_c, ib, ic) for ib, ic in pairs]
+        omega = resp_b['omega'] + resp_c['omega']
+        X2, Y2 = self.solve(omega, np.array([r[1] for r in rhs]), np.array([r[2] for r in rhs]))
+        D2 = np.array([r[0] for r in rhs]) + self._ovvo_to_full(X2, Y2)
+        F2 = self.get_kernel(D2)
+        out = []
+        for n, (ib, ic) in enumerate(pairs):
+            g = self._hyperkernel(resp_b['D1'][ib], resp_c['D1'][ic])
+            out.append((D2[n], F2[n] if g is None else F2[n] + g))
+        return out
+
+    def third_order_terms(self, resps):
+        '''Third-order quantities for first-order responses resps = (resp_b, resp_c, resp_d).
+
+        Returns a dict {(ib, ic, id): (K3, r3_ai, r3_ia)} over all component triples, where K3
+        is the occupied-occupied/virtual-virtual block of the third-order density and r3 the
+        right-hand side of the third-order linear equations at w1 + w2 + w3.  Identical
+        response objects in resps are recognized, and permutation symmetry between them is
+        used to skip redundant second- and third-order work.
+        '''
+        self._check_built()
+        log = logger.new_logger(self)
+        o = self.nocc
+        resps = list(resps)
+        if len(resps) != 3:
+            raise ValueError('third_order_terms requires three first-order responses.')
+        group = [next(j for j in range(k + 1) if resps[j] is resps[k]) for k in range(3)]
+        ncomp = [r['X'].shape[0] for r in resps]
+        slots = ((0, (1, 2)), (1, (0, 2)), (2, (0, 1)))
+
+        def pkey(p, i, q, j):
+            return tuple(sorted([(group[p], i), (group[q], j)]))
+
+        # second-order densities / Fock matrices for the three pairings (cached by symmetry)
+        d2 = {}
+        for _, (p, q) in slots:
+            todo = {}
+            for i in range(ncomp[p]):
+                for j in range(ncomp[q]):
+                    key = pkey(p, i, q, j)
+                    if key not in d2 and key not in todo:
+                        todo[key] = (i, j)
+            for key, res in zip(todo, self.second_order(resps[p], resps[q], list(todo.values()))):
+                d2[key] = res
+        log.debug('cubic response: %d second-order solutions', len(d2))
+
+        # third-order commutators, K3 and kernel terms for symmetry-unique triples
+        keys, K3s, partial = [], [], []
+        canon = {}
+        for idx in itertools.product(*[range(n) for n in ncomp]):
+            key = tuple(sorted((group[k], idx[k]) for k in range(3)))
+            canon[idx] = key
+            if key in keys:
+                continue
+            comm = np.zeros((self.nmo, self.nmo))
+            S = np.zeros((self.nmo, self.nmo))
+            extra = np.zeros((self.nmo, self.nmo))
+            for x, (p, q) in slots:
+                D1 = resps[x]['D1'][idx[x]]
+                F1 = resps[x]['F1'][idx[x]]
+                D2, F2 = d2[pkey(p, idx[p], q, idx[q])]
+                comm += F1 @ D2 - D2 @ F1 + F2 @ D1 - D1 @ F2
+                S += D1 @ D2 + D2 @ D1
+                g = self._hyperkernel(D1, D2)
+                if g is not None:
+                    extra += g
+            h = self._third_kernel(*(resps[k]['D1'][idx[k]] for k in range(3)))
+            if h is not None:
+                extra += h
+            K3 = np.zeros_like(S)
+            K3[:o, :o] = -S[:o, :o]
+            K3[o:, o:] = S[o:, o:]
+            keys.append(key)
+            K3s.append(K3)
+            partial.append((comm, extra))
+        log.debug('cubic response: %d third-order right-hand sides', len(keys))
+
+        GK3 = self.get_kernel(np.array(K3s))
+        terms = {}
+        for key, K3, (comm, extra), G in zip(keys, K3s, partial, GK3):
+            G3 = G + extra
+            terms[key] = (K3, (comm[o:, :o] + G3[o:, :o]).T, -comm[:o, o:] + G3[:o, o:])
+        return {idx: terms[key] for idx, key in canon.items()}
+
+    def _first_order_set(self, ops_list, omegas):
+        '''First-order responses for (operator, frequency) pairs, reusing identical ones.'''
+        resps = []
+        for k, (ops, w) in enumerate(zip(ops_list, omegas)):
+            for j in range(k):
+                if ops_list[j] is ops and omegas[j] == w:
+                    resps.append(resps[j])
+                    break
+            else:
+                resps.append(self.first_order(ops, w))
+        return resps
+
+    def cubic_response(self, ops_a, ops_b, ops_c, ops_d, omega1, omega2, omega3):
+        '''Cubic response function <<A; B, C, D>>_{w1, w2, w3} for all operator combinations.
+
+        ops_* are symmetric MO-basis operators of shape (n*, nmo, nmo); A is probed at
+        -(omega1 + omega2 + omega3).  Returns an (na, nb, nc, nd) array.
+        '''
+        ops_a = np.asarray(ops_a)
+        ops = [np.asarray(x) for x in (ops_b, ops_c, ops_d)]
+        omegas = (omega1, omega2, omega3)
+        omega_s = omega1 + omega2 + omega3
+        resps = self._first_order_set(ops + [ops_a], omegas + (omega_s,))
+        resp_a = resps.pop()
+        terms = self.third_order_terms(resps)
+
+        o = self.nocc
+        cr = np.zeros((ops_a.shape[0],) + tuple(r['X'].shape[0] for r in resps))
+        for idx, (K3, r_ai, r_ia) in terms.items():
+            trAK = einsum('xpq,pq->x', ops_a[:, :o, :o], K3[:o, :o]) \
+                + einsum('xpq,pq->x', ops_a[:, o:, o:], K3[o:, o:])
+            zr = einsum('xia,ia->x', resp_a['X'], r_ai) + einsum('xia,ia->x', resp_a['Y'], r_ia)
+            cr[(slice(None),) + idx] = 2.0 * (trAK + zr)
+        return cr
+
     # ------------------------------------------------------------ properties
 
     def polarizability(self, omega=0.0):
@@ -393,6 +560,32 @@ class QuadraticResponseBase(lib.StreamObject):
             for x, lab in enumerate('xyz'):
                 logger.note(self, '  %s  %s', lab, np.array2string(self.beta[x], precision=5, suppress_small=True))
         return self.beta
+
+    def second_hyperpolarizability(self, omega1=0.0, omega2=0.0, omega3=0.0):
+        '''Second hyperpolarizability gamma_xyzw(-ws; w1, w2, w3) in a.u. (Taylor convention),
+        ws = w1 + w2 + w3.  Returns a (3, 3, 3, 3) array.
+
+        Special cases:
+            static:   (0, 0, 0)
+            THG:      (w, w, w)       -> gamma(-3w; w, w, w)
+            EFISHG:   (w, w, 0)       -> gamma(-2w; w, w, 0)
+            DFWM:     (w, -w, w)      -> gamma(-w; w, -w, w)   (intensity-dependent refractive index)
+            Kerr:     (w, 0, 0)       -> gamma(-w; w, 0, 0)
+        '''
+        cput0 = (logger.process_clock(), logger.perf_counter())
+        self._check_built()
+        self.dump_flags()
+        r = self.get_dipole_mo()
+        self.gamma = -self.cubic_response(r, r, r, r, omega1, omega2, omega3)
+        logger.timer(self, '%s second hyperpolarizability' % self._label, *cput0)
+        logger.note(self, 'gamma(-%.6f; %.6f, %.6f, %.6f) (a.u.): gamma_|| = %.6f',
+                    omega1 + omega2 + omega3, omega1, omega2, omega3, gamma_parallel(self.gamma))
+        if self.verbose >= logger.INFO:
+            for x, lab in enumerate('xyz'):
+                for y, lab2 in enumerate('xyz'):
+                    logger.info(self, '  %s%s  %s', lab, lab2,
+                                np.array2string(self.gamma[x, y], precision=4, suppress_small=True))
+        return self.gamma
 
     def get_excited_states(self, nstates):
         '''Lowest singlet excited states consistent with this object's kernel,
@@ -508,42 +701,118 @@ class QuadraticResponseBase(lib.StreamObject):
         logger.timer(self, '%s two-photon absorption' % self._label, *cput0)
         return self.exci[states], tensors, self.tpa_strength
 
+    def three_photon_absorption(self, nstates=5, states=None, frequencies=None):
+        '''Three-photon absorption from the single residue of the cubic response function.
+
+        Parameters
+        ----------
+        nstates : int
+            Number of lowest singlet states to compute.
+        states : list of int, optional
+            Subset of state indices (0-based) to evaluate.
+        frequencies : optional
+            Photon frequencies (w1, w2, w3) in a.u.  The residue requires w1 + w2 + w3 = Omega_N.
+
+            * None (default): degenerate 3PA, w1 = w2 = w3 = Omega_N / 3 for every state.
+            * A single triple, used for every evaluated state.  Entries given as None share
+              the remainder Omega_N minus the given entries equally, e.g. (0.1, None, None).
+              If all three are numbers, they must sum to Omega_N for every evaluated state.
+            * A sequence of triples, one per evaluated state (in the order of `states`).
+
+        Returns
+        -------
+        exci : (n,) excitation energies
+        tensor : (n, 3, 3, 3) three-photon transition tensors T^N_BCD(w1, w2, w3) (a.u.); index
+            k belongs to the photon at w_k.  Fully symmetric for degenerate photons.
+        delta : dict with the rotationally averaged strength (a.u.) for 'linear' polarization
+            (all three photons polarized along the same axis),
+            delta = <|e_i e_j e_k T_ijk|^2>_orientations.  The photon frequencies used are
+            stored in self.tpa3_frequencies, shape (n, 3).
+        '''
+        cput0 = (logger.process_clock(), logger.perf_counter())
+        self._check_built()
+        self.dump_flags()
+        if self.exci is None or len(self.exci) < nstates:
+            self.get_excited_states(nstates)
+        if states is None:
+            states = range(min(nstates, len(self.exci)))
+        states = list(states)
+        freqs = self._photon_frequencies(states, frequencies, 3)
+        degenerate = frequencies is None
+
+        log = logger.new_logger(self)
+        r = self.get_dipole_mo()
+        tensors = np.zeros((len(states), 3, 3, 3))
+        for k, n in enumerate(states):
+            ws = tuple(freqs[k])
+            for i, j in ((0, 1), (0, 2), (1, 2)):
+                if np.any(np.abs(np.abs(ws[i] + ws[j]) - self.exci) < 1e-3):
+                    log.warn('Two-photon frequency %.6f is (near-)resonant with an excited state; '
+                             'the 3PA tensor of state %d may be unreliable.', ws[i] + ws[j], n + 1)
+            for w in ws:
+                if np.any(np.abs(np.abs(w) - self.exci) < 1e-3):
+                    log.warn('Photon frequency %.6f is (near-)resonant with an excited state; '
+                             'the 3PA tensor of state %d may be unreliable.', w, n + 1)
+            resps = self._first_order_set([r, r, r], ws)
+            for idx, (_, r_ai, r_ia) in self.third_order_terms(resps).items():
+                tensors[(k,) + idx] = np.sqrt(2.0) * (np.vdot(self.X_vec[n], r_ai)
+                                                      + np.vdot(self.Y_vec[n], r_ia))
+
+        delta_lin = _tpa3_strength(tensors)
+        self.tpa3_tensor = tensors
+        self.tpa3_strength = {'linear': delta_lin}
+        self.tpa3_frequencies = freqs
+
+        log.note('%s three-photon absorption (%s cubic response)',
+                 'Degenerate' if degenerate else 'Non-degenerate', self._label)
+        log.note('  state   Omega (eV)   w1 (eV)    w2 (eV)    w3 (eV)    delta_lin (a.u.)')
+        for k, n in enumerate(states):
+            log.note('  %5d  %10.4f  %9.4f  %9.4f  %9.4f  %16.6e', n + 1, self.exci[n] * HARTREE2EV,
+                     *(freqs[k] * HARTREE2EV), delta_lin[k])
+        logger.timer(self, '%s three-photon absorption' % self._label, *cput0)
+        return self.exci[states], tensors, self.tpa3_strength
+
     def _tpa_frequency_pairs(self, states, frequencies, tol=1e-6):
         '''Resolve the `frequencies` argument of two_photon_absorption into an
         (len(states), 2) array of photon frequencies with w1 + w2 = Omega_N.'''
+        return self._photon_frequencies(states, frequencies, 2, tol)
+
+    def _photon_frequencies(self, states, frequencies, nphoton, tol=1e-6):
+        '''Resolve a `frequencies` argument into an (len(states), nphoton) array of photon
+        frequencies summing to Omega_N.  None entries share the remainder equally.'''
         omegas = np.asarray([self.exci[n] for n in states])
         if frequencies is None:
-            return np.column_stack([omegas * 0.5, omegas * 0.5])
+            return np.repeat(omegas[:, None] / nphoton, nphoton, axis=1)
 
-        def is_pair(p):
-            return (isinstance(p, (tuple, list, np.ndarray)) and len(p) == 2
+        def is_tuple(p):
+            return (isinstance(p, (tuple, list, np.ndarray)) and len(p) == nphoton
                     and all(x is None or np.ndim(x) == 0 for x in p))
 
-        if is_pair(frequencies):
-            pairs = [frequencies] * len(states)
+        name = {2: 'pair', 3: 'triple'}.get(nphoton, '%d-tuple' % nphoton)
+        if is_tuple(frequencies):
+            tuples = [frequencies] * len(states)
         else:
-            pairs = list(frequencies)
-            if len(pairs) != len(states) or not all(is_pair(p) for p in pairs):
-                raise ValueError('frequencies must be None, a pair (w1, w2) or a sequence of '
-                                 '%d pairs, one per evaluated state.' % len(states))
+            tuples = list(frequencies)
+            if len(tuples) != len(states) or not all(is_tuple(p) for p in tuples):
+                raise ValueError('frequencies must be None, a %s or a sequence of %d %ss, one '
+                                 'per evaluated state.' % (name, len(states), name))
 
-        out = np.empty((len(states), 2))
-        for k, (n, (w1, w2)) in enumerate(zip(states, pairs)):
+        out = np.empty((len(states), nphoton))
+        for k, (n, ws) in enumerate(zip(states, tuples)):
             omega = omegas[k]
-            if w1 is None and w2 is None:
-                w1 = w2 = omega * 0.5
-            elif w1 is None:
-                w1 = omega - w2
-            elif w2 is None:
-                w2 = omega - w1
-            elif abs(w1 + w2 - omega) > tol:
-                raise ValueError('Photon frequencies w1 = %.8f and w2 = %.8f do not sum to the '
-                                 'excitation energy %.8f of state %d (difference %.2e). Pass one '
-                                 'of them as None to fix it from the other.'
-                                 % (w1, w2, omega, n + 1, w1 + w2 - omega))
+            free = [i for i, w in enumerate(ws) if w is None]
+            given = sum(w for w in ws if w is not None)
+            if free:
+                ws = [(omega - given) / len(free) if w is None else w for w in ws]
+            elif abs(given - omega) > tol:
+                raise ValueError('Photon frequencies %s do not sum to the excitation energy %.8f '
+                                 'of state %d (difference %.2e). Pass one of them as None to fix '
+                                 'it from the others.'
+                                 % (', '.join('%.8f' % w for w in ws), omega, n + 1, given - omega))
             else:
-                w2 = omega - w1   # remove the residual mismatch exactly
-            out[k] = (w1, w2)
+                ws = list(ws)
+                ws[-1] = omega - sum(ws[:-1])   # remove the residual mismatch exactly
+            out[k] = ws
         return out
 
     def transition_dipole(self):
@@ -562,6 +831,36 @@ def beta_parallel(beta, direction):
     u = u / np.linalg.norm(u)
     vec = np.einsum('ijj->i', beta) + np.einsum('jij->i', beta) + np.einsum('jji->i', beta)
     return 0.2 * np.dot(u, vec)
+
+
+def gamma_parallel(gamma):
+    '''Isotropic average gamma_|| = 1/15 sum_ij (gamma_iijj + gamma_ijij + gamma_ijji).'''
+    return (np.einsum('iijj->', gamma) + np.einsum('ijij->', gamma) + np.einsum('ijji->', gamma)) / 15.0
+
+
+def _perfect_matchings(items):
+    if not items:
+        yield []
+        return
+    first, rest = items[0], items[1:]
+    for k in range(len(rest)):
+        for m in _perfect_matchings(rest[:k] + rest[k + 1:]):
+            yield [(first, rest[k])] + m
+
+
+def _tpa3_strength(tensors):
+    '''Rotationally averaged three-photon strength for linear polarization,
+    delta = <(e_i e_j e_k T_ijk)^2> = 1/105 sum over the 15 pairings of the six indices of
+    T_ijk T_lmn (valid for non-symmetric T; reduces to (3 F + 2 G) / 35 with
+    F = sum_j (sum_i T_iij)^2, G = sum_ijk T_ijk^2 for a fully symmetric tensor).'''
+    tensors = np.asarray(tensors)
+    total = np.zeros(tensors.shape[0])
+    for match in _perfect_matchings(list(range(6))):
+        sub = [''] * 6
+        for c, (u, v) in zip('ijk', match):
+            sub[u] = sub[v] = c
+        total += np.einsum('n%s,n%s->n' % (''.join(sub[:3]), ''.join(sub[3:])), tensors, tensors)
+    return total / 105.0
 
 
 def _tpa_strength(tensors):

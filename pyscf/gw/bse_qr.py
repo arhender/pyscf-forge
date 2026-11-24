@@ -25,7 +25,10 @@ Follows N. Rauwolf, W. Klopper, C. Holzer, J. Chem. Phys. 160, 061101 (2024) and
 summary in C. Holzer, Y. J. Franzke, arXiv:2502.08753 (Eqs. 16-32):
 
 * The BSE kernel is the static screened kernel Xi(Omega) ~ W(0) used by pyscf.gw.bse.
-* The BSE hyperkernel (second derivative of the self-energy w.r.t. G) is neglected.
+* The BSE hyperkernel (second derivative of the self-energy w.r.t. G) is neglected, and so
+  are all higher kernels; cubic response (second hyperpolarizability, three-photon
+  absorption, see pyscf.tdscf.qr_base) therefore uses only G with fixed W.  No published
+  BSE cubic-response reference exists to compare against.
 
 With these approximations the BSE response equations are those of a time-dependent
 mean-field theory with a Fock operator that is linear in the density,
@@ -94,7 +97,8 @@ from pyscf import lib
 from pyscf.lib import logger
 from pyscf.gw.bse import BSE, _bse_contraction, _get_lpq_bar
 from pyscf.gw.qp_shift import scissor_shift
-from pyscf.tdscf.qr_base import QuadraticResponseBase, beta_parallel, _tpa_strength  # noqa: F401
+from pyscf.tdscf.qr_base import (QuadraticResponseBase, beta_parallel, gamma_parallel,  # noqa: F401
+                                 _tpa_strength, _tpa3_strength)
 
 einsum = lib.einsum
 
@@ -109,8 +113,9 @@ class BSEQuadraticResponse(QuadraticResponseBase):
             Hartree-Fock object.  Default True.
         xc_hyperkernel : bool
             Diagnostic option, not part of the BSE theory: add the exchange-correlation
-            hyperkernel g_xc[D1^B, D1^C] of the Kohn-Sham reference functional to the
-            second-order kernel, as in TDDFT quadratic response.  Default False.
+            hyperkernel g_xc of the Kohn-Sham reference functional to the second-order kernel
+            (and g_xc plus the third-order kernel h_xc in cubic response), as in TDDFT.
+            Default False.
     '''
 
     _label = 'BSE'
@@ -184,13 +189,19 @@ class BSEQuadraticResponse(QuadraticResponseBase):
             self._xc_qr = _reference_xc_hyperkernel(self)
         return QuadraticResponseBase.build(self)
 
-    def _second_order_kernel(self, K, D1b, D1c):
-        G2 = self.get_kernel(K)
-        if self.xc_hyperkernel:
-            if self._xc_qr is None:
-                self._xc_qr = _reference_xc_hyperkernel(self)
-            G2 = G2 + self._xc_qr.get_hyperkernel(D1b, D1c)
-        return G2
+    def _hyperkernel(self, Db, Dc):
+        if not self.xc_hyperkernel:
+            return None   # BSE hyperkernel neglected
+        if self._xc_qr is None:
+            self._xc_qr = _reference_xc_hyperkernel(self)
+        return self._xc_qr.get_hyperkernel(Db, Dc)
+
+    def _third_kernel(self, Db, Dc, Dd):
+        if not self.xc_hyperkernel:
+            return None
+        if self._xc_qr is None:
+            self._xc_qr = _reference_xc_hyperkernel(self)
+        return self._xc_qr.get_third_kernel(Db, Dc, Dd)
 
     def get_kernel(self, dm):
         '''Kernel G[D] in the full MO space for one or several (possibly non-symmetric) D.

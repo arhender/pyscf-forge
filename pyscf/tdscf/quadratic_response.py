@@ -15,7 +15,9 @@
 #
 
 '''
-Linear and quadratic response for restricted TDHF / TDDFT (adiabatic, closed shell, real orbitals).
+Linear, quadratic and cubic response for restricted TDHF / TDDFT (adiabatic, closed shell, real
+orbitals): polarizabilities, first and second hyperpolarizabilities, two- and three-photon
+absorption.
 
 Theory
 ------
@@ -32,12 +34,20 @@ response function, two-photon residues) is in pyscf.tdscf.qr_base.  The TDDFT-sp
 is G[K] + g_xc[D1^B, D1^C]; its symmetric (A+B) and skew-symmetric (A-B) channels are
 r_ai +/- r_ia, reproducing Parker Eq. 28: G[K]_ai + G[K]_ia = 2 H+[K+],
 G[K]_ai - G[K]_ia = 2 H-[K-], and g_xc only enters the symmetric channel.
+
+Cubic response additionally needs the third-order XC kernel (fourth functional derivative,
+B. Jansik et al., J. Chem. Phys. 122, 054107 (2005)),
+
+    h_xc[B,C,D] = int phi_p phi_q (d^4 E_xc / d rho^4)(rho0) rho(2B) rho(2C) rho(2D),
+
+which is controlled by the same `hyperkernel` flag as g_xc.
 '''
 
 import numpy as np
 
 from pyscf import lib, scf
-from pyscf.tdscf.qr_base import QuadraticResponseBase, beta_parallel, _tpa_strength  # noqa: F401
+from pyscf.tdscf.qr_base import (QuadraticResponseBase, beta_parallel, gamma_parallel,  # noqa: F401
+                                 _tpa_strength, _tpa3_strength)
 
 einsum = lib.einsum
 
@@ -47,7 +57,8 @@ class TDDFTQuadraticResponse(QuadraticResponseBase):
 
     Attributes (in addition to those of QuadraticResponseBase):
         hyperkernel : bool
-            Include the exchange-correlation hyperkernel g_xc (third functional derivative).
+            Include the exchange-correlation hyperkernel g_xc (third functional derivative) and,
+            in cubic response, the third-order kernel h_xc (fourth functional derivative).
             Required for consistency with finite-field derivatives.  Default True.
     '''
 
@@ -146,11 +157,38 @@ class TDDFTQuadraticResponse(QuadraticResponseBase):
                                 xc['rho0'], xc['vxc'], fxc_eff, max_memory=self.max_memory)
         return self._ao2mo(np.asarray(v).reshape(1, *v.shape[-2:]))[0]
 
-    def _second_order_kernel(self, K, D1b, D1c):
-        G2 = self.get_kernel(K)
-        if self.hyperkernel:
-            G2 = G2 + self.get_hyperkernel(D1b, D1c)
-        return G2
+    def get_third_kernel(self, dm_b, dm_c, dm_d):
+        '''Third-order XC kernel h_xc[D_b, D_c, D_d] in the MO basis for per-spin densities:
+        int phi_p phi_q (d^4 E_xc / d rho^4)(rho0) rho(2B) rho(2C) rho(2D).
+
+        The fourth derivative of the functional is evaluated on first use and cached.'''
+        self._check_built()
+        if self._xc is None:
+            return np.zeros((self.nmo, self.nmo))
+        xc = self._xc
+        if 'lxc' not in xc:
+            xc['ni'].libxc.test_deriv_order(self._scf.xc, 4, raise_error=True)
+            xc['lxc'] = xc['ni'].eval_xc_eff(self._scf.xc, xc['rho0'], deriv=4,
+                                             xctype=xc['xctype'], spin=0)[4]
+        rho_c = self._rho_on_grid(2.0 * self._mo2ao(np.asarray(dm_c)[None])[0])
+        rho_d = self._rho_on_grid(2.0 * self._mo2ao(np.asarray(dm_d)[None])[0])
+        nvar = rho_c.shape[0]
+        lxc = xc['lxc'].reshape(nvar, nvar, nvar, nvar, -1)
+        fxc_eff = einsum('xyzwg,zg,wg->xyg', lxc, rho_c, rho_d)
+        dmb_ao = 2.0 * self._mo2ao(np.asarray(dm_b)[None])[0]
+        v = xc['ni'].nr_rks_fxc(self.mol, xc['grids'], self._scf.xc, None, dmb_ao, 0, 0,
+                                xc['rho0'], xc['vxc'], fxc_eff, max_memory=self.max_memory)
+        return self._ao2mo(np.asarray(v).reshape(1, *v.shape[-2:]))[0]
+
+    def _hyperkernel(self, Db, Dc):
+        if self.hyperkernel and self._xc is not None:
+            return self.get_hyperkernel(Db, Dc)
+        return None
+
+    def _third_kernel(self, Db, Dc, Dd):
+        if self.hyperkernel and self._xc is not None:
+            return self.get_third_kernel(Db, Dc, Dd)
+        return None
 
     def _excited_states_large(self, nstates):
         td = self._scf.TDDFT() if self.is_dft else self._scf.TDHF()

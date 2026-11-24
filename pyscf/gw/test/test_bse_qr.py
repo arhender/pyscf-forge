@@ -209,6 +209,61 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(beta[2, 2, 2] / ((mpz[2] - 2 * m0[2] + mmz[2]) / h**2), 1, 3)
         self.assertAlmostEqual(beta[2, 1, 1] / ((mpy[2] - 2 * m0[2] + mmy[2]) / h**2), 1, 3)
 
+    def test_cubic_screened_finite_field(self):
+        # static BSE cubic response = third field derivative of the fixed-W model dipole
+        qr = QRBSE(gw)
+        qr.solver = 'direct'
+        o, n = qr.nocc, qr.nmo
+        r = qr.get_dipole_mo()
+        D0 = np.zeros((n, n))
+        D0[:o, :o] = np.eye(o)
+
+        def mu(E):
+            D = D0.copy()
+            for _ in range(500):
+                F = np.diag(qr.mo_energy) + qr.get_kernel(D - D0) + np.einsum('x,xpq->pq', E, r)
+                C = np.linalg.eigh(F)[1]
+                Dn = C[:, :o] @ C[:, :o].T
+                if abs(Dn - D).max() < 1e-13:
+                    break
+                D = Dn
+            return -2 * np.einsum('xpq,pq->x', r, D)
+
+        def d3(k, h):
+            e = np.eye(3)[k] * h
+            return (mu(2 * e) - 2 * mu(e) + 2 * mu(-e) - mu(-2 * e)) / (2 * h**3)
+
+        gamma = qr.second_hyperpolarizability()
+        for k in (2, 1):
+            # Richardson error is O(h^4): ~1e-3 relative at (2e-2, 1e-2), ~6e-6 at (1e-2, 5e-3)
+            ref = (4 * d3(k, 5e-3) - d3(k, 1e-2)) / 3
+            self.assertAlmostEqual(gamma[k, k, k, k] / ref[k], 1, 4)
+            self.assertAlmostEqual(gamma[3 - k, k, k, k], ref[3 - k], 3)
+
+    def test_cubic_permutation_symmetry(self):
+        # <<A; B, C, D>>_{w1, w2, w3} = <<B; A, C, D>>_{-ws, w2, w3}
+        qr = QRBSE(gw)
+        r = qr.get_dipole_mo()
+        c1 = qr.cubic_response(r, r, r, r, 0.03, 0.05, -0.02)
+        c2 = qr.cubic_response(r, r, r, r, -0.06, 0.05, -0.02)
+        self.assertAlmostEqual(abs(c1 - c2.transpose(1, 0, 2, 3)).max(), 0, 7)
+
+    def test_tpa3_residue(self):
+        qr = QRBSE(gw)
+        qr.solver = 'direct'
+        exci, T, delta = qr.three_photon_absorption(nstates=3)
+        r = qr.get_dipole_mo()
+        tdm = qr.transition_dipole()
+        n = int(np.argmax(np.abs(tdm).max(axis=1) * np.abs(T).reshape(3, -1).max(axis=1)))
+        ref = np.einsum('x,yzw->xyzw', tdm[n], T[n])
+        errs = []
+        for d in (1e-4, 1e-5):
+            w = (exci[n] - d) / 3
+            errs.append(abs(-d * qr.cubic_response(r, r, r, r, w, w, w) - ref).max())
+        self.assertLess(errs[1], 2e-3 * abs(ref).max())
+        self.assertAlmostEqual(errs[0] / errs[1], 10, 0)
+        self.assertTrue(np.all(delta['linear'] >= 0))
+
 
 if __name__ == '__main__':
     print('Full tests for BSE quadratic response')

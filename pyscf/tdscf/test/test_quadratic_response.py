@@ -137,8 +137,9 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(abs(qr.tpa_frequencies.sum(axis=1) - exci).max(), 0, 12)
         _, T21, d21 = qr.two_photon_absorption(nstates=4, frequencies=(None, w1))
         self.assertAlmostEqual(abs(T12 - T21.transpose(0, 2, 1)).max(), 0, 9)
-        self.assertAlmostEqual(abs(d12['linear'] - d21['linear']).max(), 0, 12)
-        self.assertAlmostEqual(abs(d12['circular'] - d21['circular']).max(), 0, 12)
+        # relative: delta reaches ~1e3 a.u. and is only reproducible to roundoff across runs
+        for pol in ('linear', 'circular'):
+            self.assertAlmostEqual(abs(d12[pol] - d21[pol]).max() / abs(d12[pol]).max(), 0, 12)
         self.assertTrue(np.all(d12['linear'] >= 0))
         self.assertGreater(abs(T12 - T_deg).max(), 1e-3)
 
