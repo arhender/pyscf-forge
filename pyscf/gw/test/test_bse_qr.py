@@ -134,6 +134,42 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(errs[0] / errs[1], 10, 0)
         self.assertTrue(np.all(delta['linear'] >= 0))
 
+    def test_davidson_sizing_scales_with_nstates(self):
+        # BSE.__init__ sizes the Davidson space from its default nroot = 10; the iterative
+        # excited-state path must enlarge it with nstates and never shrink user settings.
+        qr = QRBSE(gw)
+        bse = qr._bse
+        full_dim = qr.nocc * (qr.nmo - qr.nocc)
+        bse.max_vec = 50
+        qr._size_davidson(bse, 6)
+        self.assertEqual(bse.init_ntri, min(full_dim, 4 * 6))
+        self.assertEqual(bse.max_expand, 10)
+        self.assertGreaterEqual(bse.max_vec, 50)
+        self.assertLessEqual(bse.max_vec, full_dim + 2 * bse.max_expand)
+        self.assertGreaterEqual(bse.max_vec, bse.init_ntri + 2 * 6)
+
+        qr.davidson_init_per_root = 1
+        qr.davidson_space_per_root = 1
+        bse.init_ntri = 30
+        bse.max_vec = 55
+        qr._size_davidson(bse, 3)
+        self.assertEqual(bse.init_ntri, 30)
+        self.assertEqual(bse.max_vec, 55)
+
+    def test_iterative_excited_states(self):
+        qr = QRBSE(gw)
+        qr.solver = 'direct'
+        e_dir = qr.get_excited_states(5)[0]
+        qr = QRBSE(gw)
+        qr.max_dense_dim = 0
+        exci, X, Y = qr.get_excited_states(5)
+        self.assertEqual(exci.shape, (5,))
+        self.assertEqual(X.shape[0], 5)
+        self.assertAlmostEqual(abs(exci - e_dir).max(), 0, 7)
+        # the Davidson solver tracks davidson_extra_roots roots above the requested ones
+        self.assertEqual(qr._bse.nroot, 5 + qr.davidson_extra_roots)
+        self.assertGreaterEqual(qr._bse.init_ntri, 4 * 7)
+
     def test_beta_parallel_regression(self):
         qr = QRBSE(gw)
         mu = mf_ks.dip_moment(verbose=0)

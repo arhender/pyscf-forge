@@ -117,9 +117,33 @@ class BSEQuadraticResponse(QuadraticResponseBase):
             hyperkernel g_xc of the Kohn-Sham reference functional to the second-order kernel
             (and g_xc plus the third-order kernel h_xc in cubic response), as in TDDFT.
             Default False.
+        davidson_init_per_root : int
+            Lower bound on the number of initial Davidson trial vectors, per requested
+            excited state (bse.init_ntri >= davidson_init_per_root * nstates).  A larger
+            initial space reduces the chance of missing states that couple weakly to the
+            lowest orbital-energy-difference guesses.  Default 4.
+        davidson_space_per_root : int
+            Lower bound on the Davidson subspace size, per requested excited state
+            (bse.max_vec >= init_ntri + davidson_space_per_root * nstates).  The full BSE
+            Davidson adds up to 2*nstates vectors per iteration and stops with an error once
+            the subspace is full, so this allows ~davidson_space_per_root/2 iterations.
+            Capped by the memory left under max_memory.  Default 40.
+        davidson_extra_roots : int
+            Number of roots above nstates that the Davidson solver also converges and then
+            discards.  States that couple weakly to the initial guess tend to enter the
+            subspace late, just below the highest requested roots; tracking a buffer of
+            extra roots keeps them from displacing converged ones (as in VeloxChem's
+            num_extra_roots).  The init_ntri/max_vec scaling above uses
+            nstates + davidson_extra_roots.  Default 2.
+
+        Values already set on the underlying BSE object (self._bse.max_vec, .init_ntri,
+        .max_expand) are only ever increased, never decreased.
     '''
 
     _label = 'BSE'
+    davidson_init_per_root = 4
+    davidson_space_per_root = 40
+    davidson_extra_roots = 2
 
     def __init__(self, obj, screening=True, scissor=True):
         '''Initialize from a BSE object, a GW object (GWAC), or a restricted mean-field object.
@@ -354,15 +378,51 @@ class BSEQuadraticResponse(QuadraticResponseBase):
             self._set_dense(apb, amb)
         return self._apb, self._amb
 
+    def _size_davidson(self, bse, nstates):
+        '''Scale the BSE Davidson initial space, expansion and subspace size with nstates.
+
+        BSE.__init__ sizes these from its default nroot (10), so setting bse.nroot later
+        leaves them unchanged; a too-small subspace makes bse_davidson raise
+        "Exceeded max_vec" when late-appearing roots (weakly coupled to the initial guess)
+        force extra iterations.
+        '''
+        log = logger.new_logger(self)
+        full_dim = int(sum(bse.nocc[s] * (bse.nmo - bse.nocc[s]) for s in range(bse.nspin)))
+
+        init_ntri = min(full_dim, max(bse.init_ntri, self.davidson_init_per_root * nstates))
+        max_expand = max(bse.max_expand, min(100, nstates))
+        want = max(bse.max_vec, init_ntri + self.davidson_space_per_root * nstates)
+        # tri_vec, apb_prod and amb_prod each hold max_vec rows of length full_dim
+        avail = (self.max_memory - lib.current_memory()[0]) * 1e6 / (3 * 8 * max(full_dim, 1))
+        floor = max(bse.max_vec, 12 * nstates, init_ntri + 2 * nstates)
+        max_vec = want
+        if want > max(avail, floor):
+            max_vec = int(max(avail, floor))
+            log.warn('BSE Davidson subspace limited to %d vectors by max_memory (wanted %d).',
+                     max_vec, want)
+        # the subspace can never exceed the full space (+ one expansion step of slack)
+        max_vec = int(min(max_vec, full_dim + 2 * max_expand))
+
+        bse.init_ntri = int(init_ntri)
+        bse.max_expand = int(max_expand)
+        bse.max_vec = max_vec
+        log.info('BSE Davidson: nroot = %d  init_ntri = %d  max_expand = %d  max_vec = %d',
+                 nstates, bse.init_ntri, bse.max_expand, bse.max_vec)
+
     def _excited_states_large(self, nstates):
         if not self.screening:
             raise NotImplementedError('Use solver="direct" for unscreened excited states.')
         bse = self._bse
-        bse.nroot = nstates
-        bse.max_vec = max(bse.max_vec, 12 * nstates)
-        exci, X_vec, Y_vec = bse.kernel('s')
         dim = self.nocc * (self.nmo - self.nocc)
-        return exci, X_vec[0].reshape(-1, dim), Y_vec[0].reshape(-1, dim)
+        nroot = min(dim, nstates + max(0, int(self.davidson_extra_roots)))
+        bse.nroot = nroot
+        self._size_davidson(bse, nroot)
+        exci, X_vec, Y_vec = bse.kernel('s')
+        if len(exci) < nstates:
+            raise RuntimeError('BSE Davidson returned %d roots, %d requested.' % (len(exci), nstates))
+        X = X_vec[0].reshape(-1, dim)[:nstates]
+        Y = Y_vec[0].reshape(-1, dim)[:nstates]
+        return np.asarray(exci)[:nstates], X, Y
 
 
 
