@@ -78,6 +78,7 @@ def kernel(gw):
     for cycle in range(max(1, gw.max_cycle)):
         ef = gw.get_ef(mo_energy=mo_energy)
         e_w = e_mf_frz if gw.W0 else e_frz
+        gw._fs = None     # release the previous cycle's W samples and fits before rebuilding
         setup(gw, mo_energy_g=e_frz, mo_energy_w=e_w, ef=ef)
         qp_conv, conv_inds, qp = solve_qp(gw, guess=guess)
 

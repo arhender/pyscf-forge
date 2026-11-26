@@ -213,13 +213,19 @@ class QuadraticResponseBase(lib.StreamObject):
                 G = self.get_kernel(self._ovvo_to_full(X, np.zeros_like(X)))
                 a1[:, p0:p1] = G[:, o:, :o].transpose(0, 2, 1).reshape(p1 - p0, dim).T
                 b[:, p0:p1] = G[:, :o, o:].reshape(p1 - p0, dim).T
-            a = a1 + np.diag(self._orb_diff())
-            self._set_dense(a + b, a - b)
+            a1[np.diag_indices(dim)] += self._orb_diff()     # a1 = A
+            a1 += b                                          # A + B
+            b *= -2.0
+            b += a1                                          # A - B
+            self._set_dense(a1, b)
         return self._apb, self._amb
 
     def _set_dense(self, apb, amb):
-        self._apb = (apb + apb.T) * 0.5
-        self._amb = (amb + amb.T) * 0.5
+        '''Store the symmetrized dense A+B and A-B.  apb and amb are overwritten.'''
+        self._apb = lib.transpose_sum(apb, inplace=True)
+        self._apb *= 0.5
+        self._amb = lib.transpose_sum(amb, inplace=True)
+        self._amb *= 0.5
 
     def _excited_states_large(self, nstates):
         '''Iterative excited-state solver for problems above max_dense_dim.
@@ -285,15 +291,26 @@ class QuadraticResponseBase(lib.StreamObject):
         return X, Y
 
     def _solve_direct(self, omega, r_ai, r_ia):
+        '''Dense solution of the response equations for zp = X + Y, zm = X - Y,
+
+            (A+B) zp - w zm = bp,    (A-B) zm - w zp = bm,
+
+        reduced to M zp = (A-B) bp + w bm and M^T zm = (A+B) bm + w bp with
+        M = (A-B)(A+B) - w^2, which needs one dim x dim matrix and one LU factorization
+        instead of the 2*dim block system.'''
         nrhs, o, v = r_ai.shape
         dim = o * v
         apb, amb = self.get_dense_apb_amb()
-        eye = np.eye(dim)
-        mat = np.block([[apb, -omega * eye], [-omega * eye, amb]])
-        bp = -(r_ai + r_ia).reshape(nrhs, dim)
-        bm = -(r_ai - r_ia).reshape(nrhs, dim)
-        sol = scipy.linalg.solve(mat, np.hstack([bp, bm]).T, assume_a='sym')
-        zp, zm = sol[:dim].T, sol[dim:].T
+        bp = -(r_ai + r_ia).reshape(nrhs, dim).T
+        bm = -(r_ai - r_ia).reshape(nrhs, dim).T
+        M = amb @ apb
+        M[np.diag_indices(dim)] -= omega * omega
+        # factor M^T: it is the Fortran-ordered view of the C-ordered M, so LAPACK works in place
+        lu = scipy.linalg.lu_factor(M.T, overwrite_a=True, check_finite=False)
+        del M
+        zp = scipy.linalg.lu_solve(lu, amb @ bp + omega * bm, trans=1, check_finite=False)
+        zm = scipy.linalg.lu_solve(lu, apb @ bm + omega * bp, check_finite=False)
+        zp, zm = zp.T, zm.T
         return ((zp + zm) * 0.5).reshape(nrhs, o, v), ((zp - zm) * 0.5).reshape(nrhs, o, v)
 
     def _solve_iterative(self, omega, r_ai, r_ia):

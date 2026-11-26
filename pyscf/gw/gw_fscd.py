@@ -51,6 +51,12 @@ Implementation notes:
   * The real-axis W uses the same eta-broadened response function as pyscf.gw.gw_cd, so that
     fsCD reproduces canonical CD in the limit T1 -> 0.  Samples at real x are placed at
     z = x + i eta in the fit.
+  * Memory: besides the DF integrals Lpq (the only copy; no separate occupied-virtual block
+    is kept), the persistent arrays are W^c on the imaginary grid, (nw, norbs, nmo), and the
+    real-axis samples, which are stored only for the pairs that can carry a residue (occupied
+    p with occupied m, virtual p with virtual m).  The response function is accumulated over
+    blocks of occupied orbitals and W over blocks of orbitals p, with block sizes chosen
+    from gw.max_memory.
   * Accuracy is controlled by fs_t1 and fs_exact_cutoff.  W varies rapidly at small
     frequencies (|w - e_m| of the order of the valence excitation energies, where its poles
     are dense).  Residues there occur for inner-valence states (e.g. the 2s-like levels of
@@ -70,9 +76,8 @@ from scipy.optimize import newton, brentq
 from pyscf import lib
 from pyscf.lib import logger, temporary_env
 from pyscf.gw.gw_ac import set_frozen_orbs, _mo_energy_without_core, _mo_without_core
-from pyscf.gw.gw_cd import GWCD, get_WmnI_diag, get_rho_response_R
+from pyscf.gw.gw_cd import GWCD
 from pyscf.gw.utils.ac_grid import _get_scaled_legendre_roots
-from pyscf.gw.utils.gw_np_helper import mkslice
 
 einsum = lib.einsum
 
@@ -177,45 +182,142 @@ def residue_frequencies(ef, omega, mo_energy):
     return idx, fm, np.abs(mo_energy[idx] - omega)
 
 
-def get_WmnR_diag(orbs, Lpq, Lia, real_freqs, mo_energy, eta):
-    '''W^c_{pm,pm} on the real-axis sample frequencies, shape (nreal, norbs, nmo), complex.
+def _dielectric(Lpq, nocc, mo_energy, omega, eta, words):
+    '''eps = 1 - Pi in the auxiliary basis, accumulated over blocks of occupied orbitals.
 
-    Uses the same (eta-broadened) response function as canonical CD (get_rho_response_R).
+    eta None: Pi(i omega) on the imaginary axis (real; as pyscf.gw.gw_ac.get_rho_response).
+    Otherwise: Pi(omega + i eta) on the real axis with the broadening of canonical CD
+    (complex symmetric; as pyscf.gw.gw_cd.get_rho_response_R).
     '''
-    naux, nmo, _ = Lpq.shape
-    nocc = Lia.shape[1]
-    norbs = len(orbs)
-    eia = mo_energy[:nocc, None] - mo_energy[None, nocc:]
-    l_slice = Lpq[:, mkslice(orbs), :].reshape(naux, -1)
-    eye = np.eye(naux)
-    Wmn = np.empty((len(real_freqs), norbs, nmo), dtype=complex)
-    for k, w in enumerate(real_freqs):
-        Pi = get_rho_response_R(eia, w, Lia, eta)
-        # Pi_inv = (I - Pi)^-1 - I
-        Pi_inv = sla.solve(eye - Pi, eye, check_finite=False, overwrite_a=True) - eye
-        Wmn[k] = np.einsum('Pn,Pn->n', l_slice, Pi_inv @ l_slice).reshape(norbs, nmo)
-    return Wmn
+    naux, nmo = Lpq.shape[:2]
+    nvir = nmo - nocc
+    iblk = max(1, min(nocc, words // max(3 * naux * nvir, 1)))
+    er = np.zeros((naux, naux))
+    ei = None if eta is None else np.zeros((naux, naux))
+    for i0, i1 in lib.prange(0, nocc, iblk):
+        Lia = np.ascontiguousarray(Lpq[:, i0:i1, nocc:]).reshape(naux, -1)
+        eia = (mo_energy[i0:i1, None] - mo_energy[None, nocc:]).ravel()
+        if eta is None:
+            er -= (Lia * (4.0 * eia / (omega**2 + eia**2))) @ Lia.T
+        else:
+            f = 2.0 * (1.0 / (omega + eia + 2j * eta) + 1.0 / (-omega + eia))
+            er -= (Lia * f.real) @ Lia.T
+            ei -= (Lia * f.imag) @ Lia.T
+    er[np.diag_indices(naux)] += 1.0
+    if ei is None:
+        return er
+    eps = er.astype(complex)
+    del er
+    eps.imag = ei
+    return eps
+
+
+def _orbital_block(Lpq, orbs, cols):
+    '''Lpq[:, orbs, cols] as a (naux, len(orbs) * ncols) matrix; a view (no copy) when orbs
+    is a contiguous range and cols spans all orbitals.'''
+    naux = Lpq.shape[0]
+    p0 = orbs[0]
+    if list(orbs) == list(range(p0, p0 + len(orbs))):
+        return np.ascontiguousarray(Lpq[:, p0:p0 + len(orbs), cols]).reshape(naux, -1)
+    return np.ascontiguousarray(Lpq[:, orbs, cols]).reshape(naux, -1)
+
+
+def get_W_diag(Lpq, nocc, mo_energy, freqs, groups, eta=None, max_memory=4000):
+    '''Diagonal elements W^c_{pm,pm} = [L (eps^-1 - 1) L]_{pm,pm} of the correlation part of
+    the screened interaction.
+
+    freqs : imaginary frequencies (eta None; real result) or real frequencies, evaluated at
+        x + i eta with the response function of canonical CD (complex result).
+    groups : list of (orbs, cols), orbs a list of orbital indices p and cols a slice of
+        orbitals m.  Returns a list with one array (nfreq, len(orbs), ncols) per group.
+
+    eps^-1 - 1 is formed in place once per frequency (no identity matrices; with N^2
+    right-hand sides a GEMM with the inverse is faster than triangular solves) and the
+    orbitals are processed in blocks, so the temporaries are bounded by max_memory (MB)
+    apart from a few naux x naux matrices.
+    '''
+    naux, nmo = Lpq.shape[:2]
+    cplx = eta is not None
+    dtype = complex if cplx else float
+    freqs = np.asarray(freqs, dtype=float)
+    out = [np.empty((freqs.size, len(orbs), len(range(nmo)[cols])), dtype=dtype) for orbs, cols in groups]
+    # doubles available for temporaries (half of what is left under max_memory), minus the
+    # naux x naux matrices of the response function
+    words = int(max(max_memory - lib.current_memory()[0], 100) * 0.5e6 / 8) - 4 * naux * naux
+    words = max(words, 1)
+    for iw, w in enumerate(freqs):
+        eps = _dielectric(Lpq, nocc, mo_energy, w, eta, words)
+        # eps is (complex) symmetric: invert its transpose, the Fortran-ordered view, in place
+        epsinv = sla.inv(eps.T, overwrite_a=True, check_finite=False)
+        del eps
+        epsinv[np.diag_indices(naux)] -= 1.0
+        for (orbs, cols), res in zip(groups, out):
+            ncol = res.shape[2]
+            if len(orbs) == 0 or ncol == 0:
+                continue
+            per_orb = naux * ncol * (3 if cplx else 2)
+            kblk = max(1, min(len(orbs), words // max(per_orb, 1)))
+            for k0, k1 in lib.prange(0, len(orbs), kblk):
+                lblk = _orbital_block(Lpq, orbs[k0:k1], cols)
+                Q = epsinv @ lblk
+                Q *= lblk
+                res[iw, k0:k1] = Q.sum(axis=0).reshape(k1 - k0, ncol)
+                del lblk, Q
+        del epsinv
+    return out
 
 
 class _RealSamples:
-    '''Growing set of real-axis sample frequencies and the W^c_{pm,pm} sampled there.'''
+    '''Growing set of real-axis sample frequencies and W^c_{pm,pm} sampled there.
 
-    def __init__(self, gw, orbs, Lpq, Lia, mo_energy):
+    Only the elements that can enter a residue are stored: for an occupied orbital p the
+    residues of R^c (omega < e_F) belong to occupied m, for a virtual p to virtual m.  W is
+    kept as a list of per-batch arrays, so adding samples does not copy what is stored.
+    Residues of other pairs (only if the QP equation is evaluated on the other side of the
+    Fermi level) are evaluated exactly by get_sigma_c.
+    '''
+
+    def __init__(self, gw, orbs, Lpq, mo_energy):
         self.gw = gw
-        self.args = (orbs, Lpq, Lia)
+        self.Lpq = Lpq
         self.mo_energy = mo_energy
+        nocc = gw.nocc
+        nmo = Lpq.shape[1]
+        self.nocc = nocc
+        occ = [k for k, p in enumerate(orbs) if p < nocc]
+        vir = [k for k, p in enumerate(orbs) if p >= nocc]
+        self.groups = [([orbs[k] for k in occ], slice(0, nocc)), ([orbs[k] for k in vir], slice(nocc, nmo))]
+        self.col0 = [0, nocc]
+        self.ncol = [nocc, nmo - nocc]
+        self.where = {}
+        for g, ks in enumerate((occ, vir)):
+            for j, k in enumerate(ks):
+                self.where[k] = (g, j)
         self.freqs = np.zeros(0)
-        self.W = np.zeros((0, len(orbs), Lpq.shape[1]), dtype=complex)
+        self._W = [[], []]
 
     def add(self, freqs):
         freqs = np.asarray(freqs, dtype=float)
         if freqs.size == 0:
             return 0
-        orbs, Lpq, Lia = self.args
-        W = get_WmnR_diag(orbs, Lpq, Lia, freqs, self.mo_energy, self.gw.eta)
+        W = get_W_diag(self.Lpq, self.nocc, self.mo_energy, freqs, self.groups, eta=self.gw.eta,
+                       max_memory=self.gw.max_memory)
+        for g in range(2):
+            self._W[g].append(W[g])
         self.freqs = np.concatenate([self.freqs, freqs])
-        self.W = np.concatenate([self.W, W])
         return freqs.size
+
+    def owns(self, k, m):
+        '''Mask: is W_{pm,pm} sampled for orbital k of the GW list and orbitals m?'''
+        g, _ = self.where[k]
+        c = np.asarray(m) - self.col0[g]
+        return (c >= 0) & (c < self.ncol[g])
+
+    def series(self, k, m):
+        '''W_{pm,pm} at all sample frequencies (m must be owned).'''
+        g, j = self.where[k]
+        c = m - self.col0[g]
+        return np.concatenate([W[:, j, c] for W in self._W[g]])
 
     def ensure(self, cand):
         '''Add samples so that every candidate residue frequency is represented.'''
@@ -241,7 +343,7 @@ class _WFit:
         self.nreal = -1
 
     def __call__(self, m, x):
-        '''W^c_{pm,pm}(x + i eta) for real x >= 0.'''
+        '''W^c_{pm,pm}(x + i eta) for real x >= 0 (m must be owned by the samples).'''
         s = self.samples
         if s.freqs.size != self.nreal:
             self.fits = {}
@@ -249,7 +351,7 @@ class _WFit:
             self.zs = np.concatenate([self.zI, s.freqs + 1j * self.eta])
         fit = self.fits.get(m)
         if fit is None:
-            f = np.concatenate([self.WI[:, m], s.W[:, self.k, m]])
+            f = np.concatenate([self.WI[:, m], s.series(self.k, m)])
             fit = self.fits[m] = aaa_fit(self.zs, f, self.rtol, self.max_terms)
         return aaa_eval(*fit, x + 1j * self.eta)
 
@@ -277,7 +379,6 @@ def prepare(gw):
     else:
         gw.vk = gw.get_sigma_exchange(mo_coeff=mo_coeff_frz)
     gw._fs_ints = {'orbs_frz': list(gw.orbs_frz), 'Lpq': Lpq,
-                   'Lia': np.ascontiguousarray(Lpq[:, :nocc, nocc:]),
                    'mo_energy_mf': _mo_energy_without_core(gw, mf.mo_energy)}
     return gw._fs_ints
 
@@ -293,7 +394,8 @@ def setup(gw, mo_energy_g=None, mo_energy_w=None, ef=None):
     '''
     log = logger.new_logger(gw)
     ints = prepare(gw)
-    orbs_frz, Lpq, Lia = ints['orbs_frz'], ints['Lpq'], ints['Lia']
+    orbs_frz, Lpq = ints['orbs_frz'], ints['Lpq']
+    nocc, nmo = gw.nocc, Lpq.shape[1]
     e_g = ints['mo_energy_mf'] if mo_energy_g is None else np.asarray(mo_energy_g, dtype=float)
     e_w = ints['mo_energy_mf'] if mo_energy_w is None else np.asarray(mo_energy_w, dtype=float)
     if ef is None:
@@ -302,12 +404,16 @@ def setup(gw, mo_energy_g=None, mo_energy_w=None, ef=None):
 
     # imaginary axis: quadrature and W^c(i w), shared by I^c and the fits
     quad_freqs, quad_wts = _get_scaled_legendre_roots(gw.nw)
-    WmnI = get_WmnI_diag(gw, orbs_frz, Lpq, Lia, quad_freqs, e_w)
-    WmnI0 = get_WmnI_diag(gw, orbs_frz, Lpq, Lia, np.zeros(1), e_w)[0]   # W^c(i0)
+    # (W^c(i0) is the last frequency)
+    log.info('fsCD: computing W on %d imaginary frequencies', gw.nw)
+    WmnI = get_W_diag(Lpq, nocc, e_w, np.append(quad_freqs, 0.0), [(orbs_frz, slice(0, nmo))],
+                      max_memory=gw.max_memory)[0]
+    WmnI0 = WmnI[-1]
+    WmnI = WmnI[:-1]
 
     # real axis: initial sparse grid from the residues at the current energies (plus 0);
     # extended on the fly whenever a residue at the current frequency is not represented
-    samples = _RealSamples(gw, orbs_frz, Lpq, Lia, e_w)
+    samples = _RealSamples(gw, orbs_frz, Lpq, e_w)
     cand = [residue_frequencies(ef, e_g[p], e_g)[2] for p in orbs_frz]
     samples.add(build_real_grid(np.concatenate(cand), gw.fs_t1, gw.fs_t2))
     log.info('fsCD: %d residue frequencies -> %d initial real sample frequencies',
@@ -318,7 +424,7 @@ def setup(gw, mo_energy_g=None, mo_energy_w=None, ef=None):
     gw._fs = {'mo_energy': e_g, 'mo_energy_w': e_w, 'quad': (quad_freqs, quad_wts), 'WmnI': WmnI,
               'WmnI0': WmnI0,
               'samples': samples, 'fits': fits, 'sign': np.sign(ef - e_g),
-              'orbs_frz': orbs_frz, 'Lpq': Lpq, 'Lia': Lia}
+              'orbs_frz': orbs_frz, 'Lpq': Lpq}
     return gw._fs
 
 
@@ -339,16 +445,20 @@ def get_sigma_c(gw, k, omega):
     sigma = -einsum('mw,wm', g0, fs['WmnI'][:, k] - W0[None, :]) / np.pi
     sigma -= 0.5 * np.dot(np.sign(omega - e), W0)
     # R^c: residues from the rational fits of W^c; optionally the few residues at small
-    # frequencies (among the valence excitation poles of W) exactly, as in canonical CD
+    # frequencies (among the valence excitation poles of W) exactly, as in canonical CD.
+    # Residues of pairs (p, m) that are not sampled (omega on the other side of the Fermi
+    # level than e_p, e.g. a wandering Newton iterate) are evaluated exactly as well.
     idx, fm, zm = residue_frequencies(gw.ef, omega, e)
     cutoff = gw.fs_exact_cutoff or 0.0
-    exact = zm < cutoff
+    samples = fs['samples']
+    exact = (zm < cutoff) | ~samples.owns(k, idx)
     if exact.any():
         p = fs['orbs_frz'][k]
-        Wex = get_WmnR_diag([p], fs['Lpq'], fs['Lia'], zm[exact], fs['mo_energy_w'], gw.eta)[:, 0]
+        Wex = get_W_diag(fs['Lpq'], gw.nocc, fs['mo_energy_w'], zm[exact],
+                         [([p], slice(0, e.size))], eta=gw.eta, max_memory=gw.max_memory)[0][:, 0]
         sigma += np.dot(fm[exact], Wex[np.arange(Wex.shape[0]), idx[exact]])
     idx, fm, zm = idx[~exact], fm[~exact], zm[~exact]
-    fs['samples'].ensure(zm)
+    samples.ensure(zm)
     wfit = fs['fits'][k]
     for m, f, x in zip(idx, fm, zm):
         sigma += f * wfit(m, x)
@@ -386,7 +496,7 @@ def solve_qp(gw, guess=None):
             if e is not None:
                 log.debug('QP energy for orb %d: %.10f (bracketing fallback)', p_all, e)
         if e is not None and gw.fs_polish:
-            e = _polish(gw, quasiparticle, e, log, p_all)
+            e = _polish(gw, quasiparticle, e, log, p_all, k)
         if e is None:
             conv = False
             log.warn('QP equation for orbital %d did not converge', p_all)
@@ -396,7 +506,7 @@ def solve_qp(gw, guess=None):
     return conv, conv_inds, mo_energy
 
 
-def _polish(gw, f, e, log, p_all, max_rounds=4):
+def _polish(gw, f, e, log, p_all, k, max_rounds=4):
     '''Make the root exact: sample W at every fitted residue of the solution that is not yet
     a sample frequency (within 5e-6 a.u.) and restart Newton from there, until the residues
     of the root are all sample points.  The result then solves the canonical-CD QP equation.'''
@@ -404,8 +514,8 @@ def _polish(gw, f, e, log, p_all, max_rounds=4):
     samples = fs['samples']
     cutoff = gw.fs_exact_cutoff or 0.0
     for _ in range(max_rounds):
-        _, _, zm = residue_frequencies(gw.ef, e, fs['mo_energy'])
-        zm = zm[zm >= cutoff]
+        idx, _, zm = residue_frequencies(gw.ef, e, fs['mo_energy'])
+        zm = zm[(zm >= cutoff) & samples.owns(k, idx)]
         if samples.freqs.size:
             dist = np.abs(zm[:, None] - samples.freqs[None, :]).min(axis=1)
             zm = zm[dist > 5e-6]
