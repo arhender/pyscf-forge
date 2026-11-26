@@ -130,23 +130,52 @@ class _BlockLpq:
         return np.asarray(self)[key]
 
 
-def _transform_blocks(with_df, mo_coeff, nocc, max_memory):
-    '''oo, ov and vv blocks of the MO three-center integrals, transformed from the DF tensor
-    in blocks of auxiliary functions (the full (naux, nmo, nmo) tensor is never formed).'''
+def transform_df_pairs(with_df, mo_coeff, pairs, max_memory, out=None):
+    '''MO three-center integrals L[P, r, c] for selected orbital blocks, transformed from the
+    DF tensor (in core or on disk) in blocks of auxiliary functions; the full (naux, nmo, nmo)
+    tensor is never formed.
+
+    pairs : dict name -> (rows, cols), each a slice or a sequence of MO indices.
+    out : optional dict name -> writable (naux, nrow, ncol) target (C-contiguous ndarray or
+        h5py dataset).  Missing targets are allocated as ndarrays.
+    Returns the dict of targets.
+    '''
     nao, nmo = mo_coeff.shape
     naux = with_df.get_naoaux()
-    mo = np.asarray(mo_coeff, order='F')
-    slices = {'oo': (0, nocc, 0, nocc), 'ov': (0, nocc, nocc, nmo), 'vv': (nocc, nmo, nocc, nmo)}
-    out = {k: np.empty((naux, s[1] - s[0], s[3] - s[2])) for k, s in slices.items()}
+    out = {} if out is None else dict(out)
+    plans = {}
+    for k, (rows, cols) in pairs.items():
+        r = np.arange(nmo)[rows] if isinstance(rows, slice) else np.asarray(rows, dtype=int)
+        c = np.arange(nmo)[cols] if isinstance(cols, slice) else np.asarray(cols, dtype=int)
+        mo = np.asarray(np.hstack([mo_coeff[:, r], mo_coeff[:, c]]), order='F')
+        plans[k] = (mo, (0, r.size, r.size, r.size + c.size), r.size, c.size)
+        if k not in out:
+            out[k] = np.empty((naux, r.size, c.size))
+    # per auxiliary function: the AO pair block and, for targets on disk, one output row
+    words_per_aux = nao * (nao + 1) // 2 + sum(
+        nr * nc for k, (_, _, nr, nc) in plans.items() if not isinstance(out[k], np.ndarray))
     avail = max(max_memory - lib.current_memory()[0], 100) * 0.5e6 / 8
-    blksize = int(max(1, min(naux, avail // max(nao * (nao + 1) // 2 + nmo * nmo, 1))))
+    blksize = int(max(1, min(naux, avail // max(words_per_aux, 1))))
     p0 = 0
     for eri1 in with_df.loop(blksize=blksize):
         p1 = p0 + eri1.shape[0]
-        for k, ij in slices.items():
-            nr_e2(eri1, mo, ij, aosym='s2', mosym='s1', out=out[k][p0:p1])
+        for k, (mo, ij, nr, nc) in plans.items():
+            tgt = out[k]
+            if isinstance(tgt, np.ndarray) and tgt.flags.c_contiguous:
+                nr_e2(eri1, mo, ij, aosym='s2', mosym='s1', out=tgt[p0:p1])
+            else:
+                tgt[p0:p1] = nr_e2(eri1, mo, ij, aosym='s2', mosym='s1').reshape(p1 - p0, nr, nc)
         p0 = p1
     return out
+
+
+def _transform_blocks(with_df, mo_coeff, nocc, max_memory):
+    '''oo, ov and vv blocks of the MO three-center integrals, transformed from the DF tensor
+    in blocks of auxiliary functions (the full (naux, nmo, nmo) tensor is never formed).'''
+    nmo = mo_coeff.shape[1]
+    pairs = {'oo': (slice(0, nocc), slice(0, nocc)), 'ov': (slice(0, nocc), slice(nocc, nmo)),
+             'vv': (slice(nocc, nmo), slice(nocc, nmo))}
+    return transform_df_pairs(with_df, mo_coeff, pairs, max_memory)
 
 
 class BSELowMem(BSE):

@@ -97,11 +97,94 @@ import scipy.linalg
 from pyscf import lib
 from pyscf.lib import logger
 from pyscf.gw.bse import BSE
+from pyscf.gw.bse_lowmem import transform_df_pairs, _SpinLpq
 from pyscf.gw.qp_shift import scissor_shift
 from pyscf.tdscf.qr_base import (QuadraticResponseBase, beta_parallel, gamma_parallel,  # noqa: F401
                                  _tpa_strength, _tpa3_strength)
 
 einsum = lib.einsum
+
+
+class _DFBlockStore:
+    '''Occupied-occupied, occupied-virtual and virtual-virtual blocks of the MO DF integrals
+    L[P, p, q] (bare) and of the screened Lbar = eps^-1 L, aux-major.
+
+    Each block is an in-memory array or, if it does not fit the memory budget, an h5py
+    dataset in a temporary file under lib.param.TMPDIR; all access goes through slices of
+    the auxiliary index (get) or of the first orbital index (rows), so the kernels read the
+    blocks in pieces either way.  Without screening the screened blocks are the bare ones.
+    '''
+
+    NAMES = ('oo', 'ov', 'vv')
+
+    def __init__(self, naux, nocc, nvir):
+        self.naux = naux
+        self.o = nocc
+        self.v = nvir
+        self.bare = {}
+        self.scr = {}
+        self.screened_for = None    # value of `screening` the screened blocks were built for
+        self._h5 = None
+
+    def shape(self, name):
+        n1 = self.o if name[0] == 'o' else self.v
+        n2 = self.o if name[1] == 'o' else self.v
+        return (self.naux, n1, n2)
+
+    def nbytes(self, name):
+        return int(np.prod(self.shape(name))) * 8
+
+    def alloc(self, name, incore):
+        shape = self.shape(name)
+        if incore:
+            return np.empty(shape)
+        if self._h5 is None:
+            self._h5 = lib.H5TmpFile(dir=lib.param.TMPDIR)
+        n2 = max(shape[2], 1)
+        chunks = (min(shape[0], 8), max(1, min(shape[1], (1 << 16) // n2)), shape[2])
+        key = '%s_%d' % (name, len(self._h5))
+        return self._h5.create_dataset(key, shape, 'f8', chunks=chunks)
+
+    def _blocks(self, screened):
+        return self.scr if screened else self.bare
+
+    def get(self, name, p0, p1, screened=False):
+        '''Block [p0:p1] of the auxiliary index as an ndarray (a view if in memory).'''
+        return np.asarray(self._blocks(screened)[name][p0:p1])
+
+    def rows(self, name, r0, r1, screened=False):
+        '''All auxiliary functions, first orbital index r0:r1.'''
+        return np.asarray(self._blocks(screened)[name][:, r0:r1])
+
+    def full(self, p0, p1, screened, out):
+        '''Assemble L[p0:p1] (all orbital pairs) into out (L_P is symmetric).'''
+        o = self.o
+        ov = self.get('ov', p0, p1, screened)
+        out[:, :o, :o] = self.get('oo', p0, p1, screened)
+        out[:, :o, o:] = ov
+        out[:, o:, :o] = ov.transpose(0, 2, 1)
+        out[:, o:, o:] = self.get('vv', p0, p1, screened)
+        return out
+
+    def ondisk(self):
+        return ['%s%s' % ('W' if s else 'L', k) for s, d in ((0, self.bare), (1, self.scr))
+                for k, b in d.items() if not isinstance(b, np.ndarray)]
+
+
+def _place_blocks(store, budget_mb, screening):
+    '''Decide which blocks stay in memory: greedily, in the order bare oo, ov, screened oo,
+    ov, bare vv, screened vv, while the budget allows.  Returns {(name, screened): incore}.'''
+    order = [('oo', 0), ('ov', 0), ('oo', 1), ('ov', 1), ('vv', 0), ('vv', 1)]
+    left = budget_mb * 1e6
+    out = {}
+    for name, s in order:
+        if s and not screening:
+            continue
+        size = store.nbytes(name)
+        out[(name, s)] = size <= left
+        if size <= left:
+            left -= size
+    return out
 
 
 class BSEQuadraticResponse(QuadraticResponseBase):
@@ -117,36 +200,45 @@ class BSEQuadraticResponse(QuadraticResponseBase):
             hyperkernel g_xc of the Kohn-Sham reference functional to the second-order kernel
             (and g_xc plus the third-order kernel h_xc in cubic response), as in TDDFT.
             Default False.
+        incore : None or bool
+            Where the DF integral blocks (bare and screened oo/ov/vv) are kept.  None
+            (default): in memory as long as they fit max_memory minus a working reserve,
+            largest (virtual-virtual) blocks on disk otherwise; True: all in memory; False:
+            all on disk (lib.param.TMPDIR, e.g. $SLURM_TMPDIR).  The full MO DF tensor is never
+            formed when the integrals come from a density-fitting object.
         davidson_init_per_root : int
-            Lower bound on the number of initial Davidson trial vectors, per requested
-            excited state (bse.init_ntri >= davidson_init_per_root * nstates).  A larger
-            initial space reduces the chance of missing states that couple weakly to the
-            lowest orbital-energy-difference guesses.  Default 4.
+            Initial trial vectors (lowest orbital-energy differences) per tracked root of the
+            iterative excited-state solver.  A larger initial space reduces the chance of
+            missing states that couple weakly to the lowest guesses.  Default 4.
         davidson_space_per_root : int
-            Lower bound on the Davidson subspace size, per requested excited state
-            (bse.max_vec >= init_ntri + davidson_space_per_root * nstates).  The full BSE
-            Davidson adds up to 2*nstates vectors per iteration and stops with an error once
-            the subspace is full, so this allows ~davidson_space_per_root/2 iterations.
-            Capped by the memory left under max_memory.  Default 40.
+            Subspace size of the excited-state solver, per tracked root, on top of the
+            initial vectors; when it is full the solver restarts from the current Ritz
+            vectors (pyscf.tdscf._lr_eig.real_eig).  Capped by max_memory.  Default 40.
         davidson_extra_roots : int
-            Number of roots above nstates that the Davidson solver also converges and then
-            discards.  States that couple weakly to the initial guess tend to enter the
-            subspace late, just below the highest requested roots; tracking a buffer of
-            extra roots keeps them from displacing converged ones (as in VeloxChem's
-            num_extra_roots).  The init_ntri/max_vec scaling above uses
-            nstates + davidson_extra_roots.  Default 2.
-
-        Values already set on the underlying BSE object (self._bse.max_vec, .init_ntri,
-        .max_expand) are only ever increased, never decreased.
+            Number of roots above nstates that the excited-state solver also converges and
+            then discards.  States that couple weakly to the initial guess tend to enter the
+            subspace late, just below the highest requested roots; tracking a buffer of extra
+            roots keeps them from displacing requested ones (as in VeloxChem's
+            num_extra_roots).  Default 2.
+        davidson_conv_tol : float
+            Residual-norm threshold of the excited-state solver.  Default 1e-5.
+        davidson_max_cycle : int
+            Maximum iterations of the excited-state solver.  Default 100.
     '''
 
     _label = 'BSE'
     davidson_init_per_root = 4
     davidson_space_per_root = 40
     davidson_extra_roots = 2
+    davidson_conv_tol = 1e-5
+    davidson_max_cycle = 100
+    # memory kept free for temporaries when placing the integral blocks (fraction, MB floor)
+    _reserve_frac = 0.25
+    _reserve_min_mb = 2000
 
-    def __init__(self, obj, screening=True, scissor=True):
-        '''Initialize from a BSE object, a GW object (GWAC), or a restricted mean-field object.
+    def __init__(self, obj, screening=True, scissor=True, incore=None):
+        '''Initialize from a BSE object, a GW object (GWAC, GWCD, GWFSCD, ...), or a
+        restricted mean-field object.
 
         Passing a mean-field object uses its orbital energies instead of GW quasiparticle
         energies (useful for testing: with screening=False and an RHF reference this is TDHF).
@@ -155,70 +247,161 @@ class BSEQuadraticResponse(QuadraticResponseBase):
         filled in by a scissor shift (see pyscf.gw.qp_shift.scissor_shift) unless
         scissor=False.  The GW object itself is not modified.  A BSE object must already
         carry complete quasiparticle energies; apply scissor_shift to the GW object first.
+
+        Integrals: a full MO DF tensor already held by the BSE/GW object (Lpq) is used
+        through views; otherwise (e.g. GWFSCD with lowmem_ints, BSELowMem, mean-field input)
+        only the oo/ov/vv blocks are built, from the blocks of a BSELowMem or directly from
+        the density-fitting object, in memory or on disk according to `incore`.
         '''
+        bse = None
+        L = None
+        with_df = None
         if isinstance(obj, BSE):
             bse = obj
+            if bse.nspin != 1:
+                raise NotImplementedError('BSE quadratic response is implemented for restricted references only.')
+            mf, mol = bse.mf, bse.mol
+            mo_energy, mo_coeff, nocc = bse.mo_energy[0], bse.mo_coeff[0], int(bse.nocc[0])
+            verbose, stdout = bse.verbose, bse.stdout
+            L = bse.Lpq[0]
         elif hasattr(obj, '_scf') and hasattr(obj, 'mo_energy'):
-            bse = _bse_from_gw(obj, scissor)
+            gw = obj
+            if getattr(gw, 'frozen', None) is not None:
+                raise NotImplementedError('Frozen orbitals are not supported in BSE quadratic response.')
+            if np.asarray(gw.mo_energy).ndim != 1:
+                raise NotImplementedError('BSE quadratic response is implemented for restricted references only.')
+            mf, mol = gw._scf, gw.mol
+            mo_energy = scissor_shift(gw) if scissor else np.asarray(gw.mo_energy)
+            mo_coeff, nocc = np.asarray(gw.mo_coeff), int(gw.nocc)
+            verbose, stdout = gw.verbose, gw.stdout
+            L = getattr(gw, 'Lpq', None)
+            if L is not None and np.ndim(L) == 4:
+                L = L[0]
+            if not (isinstance(L, np.ndarray) and L.ndim == 3):
+                L = None
+                if getattr(gw, 'with_df', None) is None:
+                    gw.initialize_df(auxbasis=getattr(gw, 'auxbasis', None))
+                with_df = gw.with_df
         elif hasattr(obj, 'mo_energy') and hasattr(obj, 'mol'):
-            bse = _bse_from_scf(obj)
+            mf = obj
+            if np.asarray(mf.mo_energy).ndim != 1:
+                raise NotImplementedError('BSE quadratic response is implemented for restricted references only.')
+            from pyscf.gw.gw_ac import GWAC
+            gw = GWAC(mf)
+            gw.initialize_df()
+            mol, mo_energy, mo_coeff = mf.mol, np.asarray(mf.mo_energy), np.asarray(mf.mo_coeff)
+            nocc = int(np.count_nonzero(mf.mo_occ > 0))
+            verbose, stdout = mf.verbose, mf.stdout
+            with_df = gw.with_df
         else:
             raise TypeError('Expected a BSE, GW or restricted mean-field object, got %s' % type(obj))
 
-        if bse.nspin != 1:
-            raise NotImplementedError('BSE quadratic response is implemented for restricted references only.')
-
         QuadraticResponseBase.__init__(
-            self, bse.mol, bse.mo_energy[0], bse.mo_coeff[0], bse.nocc[0],
-            verbose=bse.verbose, stdout=bse.stdout,
-            max_memory=getattr(bse.mf, 'max_memory', bse.mol.max_memory))
+            self, mol, mo_energy, mo_coeff, nocc, verbose=verbose, stdout=stdout,
+            max_memory=getattr(mf, 'max_memory', mol.max_memory))
         self._bse = bse
-        # shared with the BSE/GW object (no copy unless it is not C-contiguous)
-        self.Lpq = np.ascontiguousarray(bse.Lpq[0])
+        self._mf = mf
         if np.count_nonzero(self.mo_energy == 0.0) > 0:
             raise RuntimeError(
                 'Some quasiparticle energies are exactly zero: GW was probably restricted to gw.orbs. '
                 'Apply pyscf.gw.qp_shift.scissor_shift(gw, inplace=True) before building BSE, '
                 'or pass the GW object (scissor=True) instead.')
-        if self.Lpq.shape[1] != self.nmo or self.mo_coeff.shape[1] != self.nmo:
+        if self.mo_coeff.shape[1] != self.nmo or (L is not None and L.shape[1] != self.nmo):
             raise NotImplementedError('Frozen orbitals are not supported in BSE quadratic response.')
 
         self.screening = screening
+        self.incore = incore
         self.xc_hyperkernel = False
-        self._Lbar_oo = self._Lbar_ov = self._Lbar_vv = None
         self._xc_qr = None
+        self._store = self._init_store(L, with_df)
+        self.naux = self._store.naux
+
+    # ------------------------------------------------------------ integral blocks
+
+    def _block_budget_mb(self):
+        '''Memory (MB) available for in-memory integral blocks.'''
+        left = self.max_memory - lib.current_memory()[0]
+        return left - max(self._reserve_frac * self.max_memory, self._reserve_min_mb)
+
+    def _placement(self, store):
+        if self.incore is None:
+            return _place_blocks(store, self._block_budget_mb(), self.screening)
+        keys = [(n, s) for n in store.NAMES for s in (0, 1) if self.screening or not s]
+        return {k: bool(self.incore) for k in keys}
+
+    def _init_store(self, L, with_df):
+        '''Bare oo/ov/vv blocks: views of a full in-memory tensor, adopted BSELowMem blocks,
+        or transformed from the DF object into memory/disk targets.'''
+        o, n = self.nocc, self.nmo
+        if L is not None and isinstance(L, _SpinLpq):
+            store = _DFBlockStore(L.naux, o, n - o)
+            store.bare = dict(L.b)
+            return store
+        if L is not None:
+            L = np.asarray(L)
+            store = _DFBlockStore(L.shape[0], o, n - o)
+            store.bare = {'oo': L[:, :o, :o], 'ov': L[:, :o, o:], 'vv': L[:, o:, o:]}
+            return store
+        naux = with_df.get_naoaux()
+        store = _DFBlockStore(naux, o, n - o)
+        place = self._placement(store)
+        targets = {k: store.alloc(k, place[(k, 0)]) for k in store.NAMES}
+        pairs = {'oo': (slice(0, o), slice(0, o)), 'ov': (slice(0, o), slice(o, n)),
+                 'vv': (slice(o, n), slice(o, n))}
+        cput0 = (logger.process_clock(), logger.perf_counter())
+        with lib.temporary_env(with_df, verbose=0):
+            store.bare = transform_df_pairs(with_df, self.mo_coeff, pairs, self.max_memory, out=targets)
+        logger.timer(self, 'BSE DF integral blocks', *cput0)
+        return store
+
+    @property
+    def Lpq(self):
+        '''Full MO DF tensor (naux, nmo, nmo), assembled on demand (small systems/tests only).'''
+        out = np.empty((self.naux, self.nmo, self.nmo))
+        return self._store.full(0, self.naux, False, out)
 
     def _dump_method_flags(self, log):
-        log.info('naux = %d', self.Lpq.shape[0])
+        log.info('naux = %d', self.naux)
         log.info('screened kernel (BSE) = %s', self.screening)
         log.info('BSE hyperkernel neglected (static screening)')
+        disk = self._store.ondisk()
+        log.info('DF integral blocks on disk: %s', ', '.join(disk) if disk else 'none')
         if self.xc_hyperkernel:
             log.info('DIAGNOSTIC: reference XC hyperkernel added to second-order kernel (%s)',
-                     getattr(self._bse.mf, 'xc', None))
+                     getattr(self._mf, 'xc', None))
 
     def build(self):
         '''Precompute the screened DF blocks used by the kernel contractions.
 
         Only the occupied-occupied, occupied-virtual and virtual-virtual blocks of
         Lbar = eps^-1 L (eps = 1 - Pi(0) in the auxiliary basis) are stored; each Lbar_P is
-        symmetric in its orbital indices, so the virtual-occupied block is not needed.  The
-        bare three-center integrals are always used through views of self.Lpq, so no other
-        copy of the DF tensor is made.  Without screening the blocks are views of Lpq.
+        symmetric in its orbital indices, so the virtual-occupied block is not needed.  They
+        go to memory or disk like the bare blocks (see `incore`).  Without screening the
+        screened blocks are the bare ones.
         '''
-        o = self.nocc
-        L = self.Lpq
-        if self.screening:
-            invd = _inverse_dielectric(self, L, self.mo_energy, o)
-            self._Lbar_oo = _apply_aux(self, invd, L[:, :o, :o])
-            self._Lbar_ov = _apply_aux(self, invd, L[:, :o, o:])
-            self._Lbar_vv = _apply_aux(self, invd, L[:, o:, o:])
-            del invd
-        else:
-            self._Lbar_oo, self._Lbar_ov, self._Lbar_vv = L[:, :o, :o], L[:, :o, o:], L[:, o:, o:]
+        if self._store.screened_for != self.screening:
+            self._build_screened()
         self._xc_qr = None
         if self.xc_hyperkernel:
             self._xc_qr = _reference_xc_hyperkernel(self)
         return QuadraticResponseBase.build(self)
+
+    def _build_screened(self):
+        store = self._store
+        if not self.screening:
+            store.scr = dict(store.bare)
+        else:
+            cput0 = (logger.process_clock(), logger.perf_counter())
+            invd = _inverse_dielectric(self, store, self.mo_energy, self.nocc)
+            place = self._placement(store)
+            scr = {}
+            for name in store.NAMES:
+                scr[name] = store.alloc(name, place[(name, 1)])
+                _apply_aux(self, invd, store, name, scr[name])
+            del invd
+            store.scr = scr
+            logger.timer(self, 'BSE screened DF blocks', *cput0)
+        store.screened_for = self.screening
 
     def _mem_words(self):
         '''Doubles available for temporaries: half of what is left under max_memory.'''
@@ -228,17 +411,11 @@ class BSEQuadraticResponse(QuadraticResponseBase):
     def _aux_blksize(self, words_per_row):
         '''Number of auxiliary functions per block for temporaries of words_per_row doubles
         per auxiliary function.'''
-        return max(1, min(self.Lpq.shape[0], self._mem_words() // max(int(words_per_row), 1)))
+        return max(1, min(self.naux, self._mem_words() // max(int(words_per_row), 1)))
 
     def _lbar_full(self, p0, p1, out):
         '''Assemble Lbar[p0:p1] (all orbital pairs) from the stored blocks into out.'''
-        o = self.nocc
-        ov = self._Lbar_ov[p0:p1]
-        out[:, :o, :o] = self._Lbar_oo[p0:p1]
-        out[:, :o, o:] = ov
-        out[:, o:, :o] = ov.transpose(0, 2, 1)
-        out[:, o:, o:] = self._Lbar_vv[p0:p1]
-        return out
+        return self._store.full(p0, p1, True, out)
 
     def _hyperkernel(self, Db, Dc):
         if not self.xc_hyperkernel:
@@ -259,8 +436,9 @@ class BSEQuadraticResponse(QuadraticResponseBase):
 
         G[D]_pq = 2 sum_rs (pq|rs) D_rs - sum_rs W(pr|sq) D_rs
 
-        The exchange-type term is accumulated over blocks of auxiliary functions, one density
-        at a time, so the temporaries are a few blocks of size (naux_blk, nmo, nmo).
+        Both terms are accumulated over blocks of auxiliary functions (each block of the
+        bare and screened integrals is read once for all densities), so the temporaries are a
+        few blocks of size (naux_blk, nmo, nmo).
         '''
         self._check_built()
         dm = np.asarray(dm, dtype=float)
@@ -268,19 +446,23 @@ class BSEQuadraticResponse(QuadraticResponseBase):
         if single:
             dm = dm[None]
         n = dm.shape[0]
-        L = self.Lpq
-        naux, nmo = L.shape[:2]
-        L2 = L.reshape(naux, nmo * nmo)
-        rho = L2 @ dm.reshape(n, nmo * nmo).T                  # (naux, n)
-        out = (rho.T @ L2).reshape(n, nmo, nmo)
-        out *= 2.0
-        # Lbar block, T and einsum's transposed copy of T: about 3 nmo^2 per aux function
-        blk = self._aux_blksize(3 * nmo * nmo)
+        nmo = self.nmo
+        store = self._store
+        out = np.zeros((n, nmo, nmo))
+        dm2 = dm.reshape(n, nmo * nmo)
+        # L and Lbar blocks, T and einsum's transposed copy of T: about 4 nmo^2 per aux function
+        blk = self._aux_blksize(4 * nmo * nmo)
+        lbuf = np.empty((blk, nmo, nmo))
         wbuf = np.empty((blk, nmo, nmo))
-        for p0, p1 in lib.prange(0, naux, blk):
-            W = self._lbar_full(p0, p1, wbuf[:p1 - p0])
+        for p0, p1 in lib.prange(0, self.naux, blk):
+            b = p1 - p0
+            L = store.full(p0, p1, False, lbuf[:b])
+            W = store.full(p0, p1, True, wbuf[:b])
+            L2 = L.reshape(b, nmo * nmo)
+            rho = L2 @ dm2.T                                   # (b, n)
+            out += 2.0 * (rho.T @ L2).reshape(n, nmo, nmo)
             for k in range(n):
-                T = einsum('Ppr,rs->Pps', L[p0:p1], dm[k])
+                T = einsum('Ppr,rs->Pps', L, dm[k])
                 out[k] -= einsum('Pps,Psq->pq', T, W)
                 del T
         return out[0] if single else out
@@ -293,22 +475,24 @@ class BSEQuadraticResponse(QuadraticResponseBase):
             wb_ia = -sum_jb W(ib|ja) z_jb
 
         so that (A + B) z = d z + 4 vz + wa + wb and (A - B) z = d z + wa - wb (singlet; the
-        same terms as pyscf.gw.bse._bse_contraction).  Accumulated over auxiliary blocks on
-        views of Lpq.
+        same terms as pyscf.gw.bse._bse_contraction).  Accumulated over auxiliary blocks; each
+        block of the integrals is read once for all n vectors.
         '''
         n, o, v = z.shape
-        L = self.Lpq
+        store = self._store
         vz = np.zeros((n, o, v))
         wa = np.zeros((n, o, v))
         wb = np.zeros((n, o, v))
         zt = z.transpose(0, 2, 1)
-        blk = self._aux_blksize(4 * o * v + 3 * o * o)
-        for p0, p1 in lib.prange(0, L.shape[0], blk):
+        # per aux function: L_ov, L_vv (a copy if on disk), Lbar_oo/ov (copies if on disk),
+        # T and U temporaries
+        blk = self._aux_blksize(4 * o * v + 3 * o * o + v * v)
+        for p0, p1 in lib.prange(0, self.naux, blk):
             b = p1 - p0
-            Lov = np.ascontiguousarray(L[p0:p1, :o, o:]).reshape(b, o * v)
-            Lvv = L[p0:p1, o:, o:]                                         # view
-            Boo = self._Lbar_oo[p0:p1].transpose(1, 0, 2).reshape(o, b * o)  # [i, (P, j)]
-            Bov = self._Lbar_ov[p0:p1].reshape(b * o, v)                   # [(P, j), a]
+            Lov = np.ascontiguousarray(store.get('ov', p0, p1)).reshape(b, o * v)
+            Lvv = store.get('vv', p0, p1)
+            Boo = store.get('oo', p0, p1, True).transpose(1, 0, 2).reshape(o, b * o)  # [i, (P, j)]
+            Bov = np.ascontiguousarray(store.get('ov', p0, p1, True)).reshape(b * o, v)  # [(P, j), a]
             rho = Lov @ z.reshape(n, o * v).T
             vz += (rho.T @ Lov).reshape(n, o, v)
             Lov = Lov.reshape(b, o, v)
@@ -317,18 +501,29 @@ class BSEQuadraticResponse(QuadraticResponseBase):
                 wa[k] -= Boo @ T.reshape(b * o, v)
                 U = np.matmul(Lov, zt[k])                   # U[P, i, j] = sum_b L_P,ib z_jb
                 wb[k] -= U.transpose(1, 0, 2).reshape(o, b * o) @ Bov
+            del Lov, Lvv, Boo, Bov
         return vz, wa, wb
 
-    def apb_amb_prod(self, zp, zm):
-        '''Return (A+B) zp and (A-B) zm for vectors in the (occ, vir) flattened space.'''
+    def _apb_amb_batch(self, zp, zm):
+        '''(A+B) zp and (A-B) zm for stacks of vectors (np, dim) and (nm, dim), in one pass
+        over the integrals.'''
         self._check_built()
         o = self.nocc
         v = self.nmo - o
+        zp = np.asarray(zp).reshape(-1, o * v)
+        zm = np.asarray(zm).reshape(-1, o * v)
+        npl = zp.shape[0]
         d = self._orb_diff()
-        vz, wa, wb = self._bse_terms(np.stack([zp.reshape(o, v), zm.reshape(o, v)]))
-        apb = d * zp.ravel() + (4.0 * vz[0] + wa[0] + wb[0]).ravel()
-        amb = d * zm.ravel() + (wa[1] - wb[1]).ravel()
+        vz, wa, wb = self._bse_terms(np.vstack([zp, zm]).reshape(-1, o, v))
+        dim = o * v
+        apb = d * zp + (4.0 * vz[:npl] + wa[:npl] + wb[:npl]).reshape(npl, dim)
+        amb = d * zm + (wa[npl:] - wb[npl:]).reshape(-1, dim)
         return apb, amb
+
+    def apb_amb_prod(self, zp, zm):
+        '''Return (A+B) zp and (A-B) zm for vectors in the (occ, vir) flattened space.'''
+        apb, amb = self._apb_amb_batch(np.ravel(zp)[None], np.ravel(zm)[None])
+        return apb[0], amb[0]
 
     def _lr_matvec(self, omega, X, Y):
         '''[[A - w, B], [B, A + w]] (X, Y) with A z = d z + 2 vz + wa, B z = 2 vz + wb.'''
@@ -347,22 +542,23 @@ class BSEQuadraticResponse(QuadraticResponseBase):
             o = self.nocc
             v = self.nmo - o
             dim = o * v
-            L = self.Lpq
+            store = self._store
             apb = np.zeros((dim, dim))
             amb = np.zeros((dim, dim))
             apb4 = apb.reshape(o, v, o, v)
             amb4 = amb.reshape(o, v, o, v)
-            blk = self._aux_blksize(2 * dim + v * v)
-            for p0, p1 in lib.prange(0, L.shape[0], blk):
+            blk = self._aux_blksize(2 * dim + v * v + o * o)
+            for p0, p1 in lib.prange(0, self.naux, blk):
                 b = p1 - p0
-                Lov = np.ascontiguousarray(L[p0:p1, :o, o:]).reshape(b, dim)
+                Lov = np.ascontiguousarray(store.get('ov', p0, p1)).reshape(b, dim)
                 lib.dot(Lov.T, Lov, 4.0, apb, 1.0)                      # 4 (ia|jb)
-                Lvv = np.ascontiguousarray(L[p0:p1, o:, o:]).reshape(b, v * v)
-                Bov = np.ascontiguousarray(self._Lbar_ov[p0:p1]).reshape(b, dim)
+                Lvv = np.ascontiguousarray(store.get('vv', p0, p1)).reshape(b, v * v)
+                Bov = np.ascontiguousarray(store.get('ov', p0, p1, True)).reshape(b, dim)
+                Boo = store.get('oo', p0, p1, True)
                 Lov = Lov.reshape(b, o, v)
                 for i in range(o):
                     # W(ij|ab) = sum_P Lbar_P,ij L_P,ab  -> [j, a, b]
-                    wa = (self._Lbar_oo[p0:p1, i, :].T @ Lvv).reshape(o, v, v)
+                    wa = (Boo[:, i, :].T @ Lvv).reshape(o, v, v)
                     # W(ib|ja) = sum_P Lbar_P,ja L_P,ib  -> [(j, a), b]
                     wb = (Bov.T @ Lov[:, i, :]).reshape(o, v, v)
                     wa = wa.transpose(1, 0, 2)                           # [a, j, b]
@@ -378,64 +574,73 @@ class BSEQuadraticResponse(QuadraticResponseBase):
             self._set_dense(apb, amb)
         return self._apb, self._amb
 
-    def _size_davidson(self, bse, nstates):
-        '''Scale the BSE Davidson initial space, expansion and subspace size with nstates.
-
-        BSE.__init__ sizes these from its default nroot (10), so setting bse.nroot later
-        leaves them unchanged; a too-small subspace makes bse_davidson raise
-        "Exceeded max_vec" when late-appearing roots (weakly coupled to the initial guess)
-        force extra iterations.
-        '''
-        log = logger.new_logger(self)
-        full_dim = int(sum(bse.nocc[s] * (bse.nmo - bse.nocc[s]) for s in range(bse.nspin)))
-
-        init_ntri = min(full_dim, max(bse.init_ntri, self.davidson_init_per_root * nstates))
-        max_expand = max(bse.max_expand, min(100, nstates))
-        want = max(bse.max_vec, init_ntri + self.davidson_space_per_root * nstates)
-        # tri_vec, apb_prod and amb_prod each hold max_vec rows of length full_dim
-        avail = (self.max_memory - lib.current_memory()[0]) * 1e6 / (3 * 8 * max(full_dim, 1))
-        floor = max(bse.max_vec, 12 * nstates, init_ntri + 2 * nstates)
-        max_vec = want
-        if want > max(avail, floor):
-            max_vec = int(max(avail, floor))
-            log.warn('BSE Davidson subspace limited to %d vectors by max_memory (wanted %d).',
-                     max_vec, want)
-        # the subspace can never exceed the full space (+ one expansion step of slack)
-        max_vec = int(min(max_vec, full_dim + 2 * max_expand))
-
-        bse.init_ntri = int(init_ntri)
-        bse.max_expand = int(max_expand)
-        bse.max_vec = max_vec
-        log.info('BSE Davidson: nroot = %d  init_ntri = %d  max_expand = %d  max_vec = %d',
-                 nstates, bse.init_ntri, bse.max_expand, bse.max_vec)
-
     def _excited_states_large(self, nstates):
+        '''Lowest singlet BSE excitations with the restarted Davidson solver of
+        pyscf.tdscf._lr_eig.real_eig on the integral-block matrix-vector products.  Tracks
+        nstates + davidson_extra_roots roots and returns the lowest nstates.'''
+        from pyscf.tdscf import _lr_eig
         if not self.screening:
             raise NotImplementedError('Use solver="direct" for unscreened excited states.')
-        bse = self._bse
+        self._check_built()
+        log = logger.new_logger(self)
         dim = self.nocc * (self.nmo - self.nocc)
+        d = self._orb_diff()
         nroot = min(dim, nstates + max(0, int(self.davidson_extra_roots)))
-        bse.nroot = nroot
-        self._size_davidson(bse, nroot)
-        exci, X_vec, Y_vec = bse.kernel('s')
-        if len(exci) < nstates:
-            raise RuntimeError('BSE Davidson returned %d roots, %d requested.' % (len(exci), nstates))
-        X = X_vec[0].reshape(-1, dim)[:nstates]
-        Y = Y_vec[0].reshape(-1, dim)[:nstates]
-        return np.asarray(exci)[:nstates], X, Y
+        ninit = min(dim, max(nroot, self.davidson_init_per_root * nroot))
+        max_space = min(dim, ninit + self.davidson_space_per_root * nroot)
+        # new trial vectors per iteration only for the tracked roots (real_eig's default of
+        # up to 20 would multiply the cost of each pass over the integrals)
+        space_inc = nroot
+        # real_eig keeps 4 (dim, max_space) holders: max_space = mem / (8 * 4 dim) / 2 - space_inc
+        mem_mb = (max_space + space_inc) * 2 * 4 * dim * 8 / 1e6
+        avail = 0.5 * (self.max_memory - lib.current_memory()[0])
+        if mem_mb > avail:
+            log.warn('BSE excited-state subspace limited by max_memory (%.0f MB wanted, %.0f MB free)',
+                     mem_mb, avail)
+            mem_mb = max(avail, 4 * nroot * 2 * 4 * dim * 8 / 1e6)
+        log.info('BSE Davidson (real_eig): nroot = %d (%d requested)  initial = %d  max_space = %d',
+                 nroot, nstates, ninit, max_space)
+
+        x0 = np.zeros((ninit, 2 * dim))
+        x0[np.arange(ninit), np.argsort(d, kind='stable')[:ninit]] = 1.0
+        diag = np.concatenate([d, -d])
+
+        def aop(xs):
+            xs = np.asarray(xs)
+            X, Y = xs[:, :dim], xs[:, dim:]
+            P, M = self._apb_amb_batch(X + Y, X - Y)
+            return np.hstack([0.5 * (P + M), -0.5 * (P - M)])
+
+        def precond(dx, e):
+            den = diag[None, :] - np.asarray(e)[:, None]
+            den[np.abs(den) < 1e-8] = 1e-8
+            return dx / den
+
+        cput0 = (logger.process_clock(), logger.perf_counter())
+        with lib.temporary_env(_lr_eig, MAX_SPACE_INC=None):
+            conv, e, xy = _lr_eig.real_eig(aop, x0, precond, tol_residual=self.davidson_conv_tol,
+                                           nroots=nroot, max_cycle=self.davidson_max_cycle,
+                                           max_memory=mem_mb, verbose=log)
+        logger.timer(self, 'BSE Davidson', *cput0)
+        conv = np.asarray(conv)
+        if len(e) < nstates or not np.all(conv[:nstates]):
+            raise RuntimeError('BSE excited states not converged (converged: %s, energies %s)'
+                               % (conv, e))
+        if not np.all(conv):
+            log.warn('BSE Davidson: extra (buffer) roots not converged: %s', conv)
+        xy = np.asarray(xy)
+        return np.asarray(e)[:nstates], xy[:nstates, :dim], xy[:nstates, dim:]
 
 
-
-def _inverse_dielectric(qr, L, mo_energy, nocc):
+def _inverse_dielectric(qr, store, mo_energy, nocc):
     '''eps^-1 = (1 - Pi(0))^-1 in the auxiliary basis (restricted, spin-summed static
-    response), accumulated over blocks of occupied orbitals.'''
-    naux, nmo = L.shape[:2]
-    nvir = nmo - nocc
+    response), accumulated over blocks of occupied orbitals of the bare ov block.'''
+    naux, nvir = store.naux, store.v
     eps = np.zeros((naux, naux))
     # one occupied orbital needs 2 * naux * nvir doubles (Lia chunk + Pia)
     iblk = max(1, min(nocc, qr._mem_words() // max(2 * naux * nvir, 1)))
     for i0, i1 in lib.prange(0, nocc, iblk):
-        Lia = np.ascontiguousarray(L[:, i0:i1, nocc:]).reshape(naux, -1)
+        Lia = np.ascontiguousarray(store.rows('ov', i0, i1)).reshape(naux, -1)
         eia = 4.0 / (mo_energy[i0:i1, None] - mo_energy[None, nocc:])
         Pia = Lia * eia.reshape(1, -1)
         lib.dot(Pia, Lia.T, -1.0, eps, 1.0)
@@ -443,15 +648,14 @@ def _inverse_dielectric(qr, L, mo_energy, nocc):
     return scipy.linalg.inv(eps, overwrite_a=True, check_finite=False)
 
 
-def _apply_aux(qr, invd, Lblk):
-    '''invd @ Lblk for a (naux, n1, n2) view of the DF tensor, in chunks of the first
-    orbital index (contiguous result).'''
-    naux, n1, n2 = Lblk.shape
-    out = np.empty((naux, n1, n2))
+def _apply_aux(qr, invd, store, name, out):
+    '''out = invd @ L_name for the bare block `name` of the store, in chunks of the first
+    orbital index (out is an array or an h5py dataset).'''
+    naux, n1, n2 = store.shape(name)
     # one orbital row needs 2 * naux * n2 doubles (copy of the input chunk + product)
     rblk = max(1, min(n1, qr._mem_words() // max(2 * naux * n2, 1)))
     for r0, r1 in lib.prange(0, n1, rblk):
-        chunk = np.ascontiguousarray(Lblk[:, r0:r1]).reshape(naux, -1)
+        chunk = np.ascontiguousarray(store.rows(name, r0, r1)).reshape(naux, -1)
         out[:, r0:r1] = (invd @ chunk).reshape(naux, r1 - r0, n2)
     return out
 
@@ -459,7 +663,7 @@ def _apply_aux(qr, invd, Lblk):
 def _reference_xc_hyperkernel(qr):
     '''TDDFT helper evaluating the reference functional's XC hyperkernel on the BSE orbitals.'''
     from pyscf.tdscf.quadratic_response import TDDFTQuadraticResponse
-    mf = qr._bse.mf
+    mf = qr._mf
     if not np.allclose(np.asarray(mf.mo_coeff), qr.mo_coeff):
         raise RuntimeError('xc_hyperkernel requires the BSE orbitals to be the reference KS orbitals.')
     helper = TDDFTQuadraticResponse(mf)
@@ -468,26 +672,6 @@ def _reference_xc_hyperkernel(qr):
     if helper._xc is None:
         logger.warn(qr, 'xc_hyperkernel: reference has no semilocal XC part; the term is zero.')
     return helper
-
-
-def _bse_from_gw(gw, scissor=True):
-    if getattr(gw, 'frozen', None) is not None:
-        raise NotImplementedError('Frozen orbitals are not supported in BSE quadratic response.')
-    if getattr(gw, 'Lpq', None) is None and getattr(gw, 'with_df', None) is None:
-        gw.initialize_df(auxbasis=getattr(gw, 'auxbasis', None))
-    bse = BSE(gw)
-    if scissor and np.asarray(gw.mo_energy).ndim == 1:
-        bse.mo_energy = scissor_shift(gw)[None, :]
-    return bse
-
-
-def _bse_from_scf(mf):
-    from pyscf.gw.gw_ac import GWAC
-    if np.asarray(mf.mo_energy).ndim != 1:
-        raise NotImplementedError('BSE quadratic response is implemented for restricted references only.')
-    gw = GWAC(mf)
-    gw.initialize_df()
-    return BSE(gw)
 
 
 QRBSE = BSEQuadraticResponse

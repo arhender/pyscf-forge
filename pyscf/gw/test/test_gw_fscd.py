@@ -120,6 +120,48 @@ class KnownValues(unittest.TestCase):
             self.assertAlmostEqual(gw.mo_energy[p], ref.mo_energy[p], 3)
 
 
+    def test_lowmem_ints(self):
+        # only the ov block and the GW-orbital rows of Lpq, from an AO DF tensor on disk
+        orbs = range(nocc - 3, nocc + 3)
+        ref = GWFSCD(mf)
+        ref.orbs = orbs
+        ref.fs_exact_cutoff = 2.0
+        ref.qpe_tol = 1e-12
+        ref.kernel()
+        gw = GWFSCD(mf)
+        gw.orbs = orbs
+        gw.fs_exact_cutoff = 2.0
+        gw.qpe_tol = 1e-12
+        gw.lowmem_ints = True
+        gw.initialize_df()
+        gw._cderi_tmpfile = None
+        gw.with_df._cderi_to_save = gw_fscd.lib.NamedTemporaryFile().name   # force on disk
+        gw.kernel()
+        self.assertIsNone(gw.Lpq)
+        win = gw._fs_ints['Lpq']
+        self.assertIsInstance(win, gw_fscd._WindowLpq)
+        L = ref.Lpq
+        self.assertAlmostEqual(abs(win.ov - L[:, :nocc, nocc:]).max(), 0, 12)
+        self.assertAlmostEqual(abs(win.rows - L[:, list(orbs)]).max(), 0, 12)
+        e = np.asarray(list(orbs))
+        # W and Sigma are identical to roundoff; the AAA fits of the sampled residues amplify
+        # that roundoff to ~1e-8 Ha, so compare QP energies at 1e-6
+        self.assertAlmostEqual(abs(gw.mo_energy[e] - ref.mo_energy[e]).max(), 0, 6)
+        w = [0.3, 1.1]
+        n = L.shape[1]
+        Wa = gw_fscd.get_W_diag(L, nocc, mf.mo_energy, w, [(list(orbs), slice(0, n))], eta=ref.eta)[0]
+        Wb = gw_fscd.get_W_diag(win, nocc, mf.mo_energy, w, [(list(orbs), slice(0, n))], eta=ref.eta)[0]
+        self.assertAlmostEqual(abs(Wa - Wb).max(), 0, 12)
+
+        # BSE quadratic response from the low-memory GW object builds its own blocks
+        from pyscf.gw.bse_qr import QRBSE
+        qa, qb = QRBSE(ref), QRBSE(gw)
+        qa.solver = qb.solver = 'direct'
+        self.assertAlmostEqual(abs(qa.Lpq - qb.Lpq).max(), 0, 12)
+        ea = qa.get_excited_states(3)[0]
+        eb = qb.get_excited_states(3)[0]
+        self.assertAlmostEqual(abs(ea - eb).max(), 0, 5)
+
 if __name__ == '__main__':
     print('Full tests for fsCD-GW')
     unittest.main()

@@ -212,6 +212,78 @@ def _dielectric(Lpq, nocc, mo_energy, omega, eta, words):
     return eps
 
 
+class _WindowLpq:
+    '''(naux, nmo, nmo) array-like over the only parts of the MO DF integrals fsCD-GW uses:
+    the occupied-virtual block (response function) and the rows of the GW orbitals (window
+    rows, all columns; self-energy and W_{pm,pm}).  Used with GWFSCD.lowmem_ints.'''
+
+    ndim = 3
+    dtype = np.dtype(np.float64)
+
+    def __init__(self, ov, rows, orbs, nocc, nmo):
+        self.ov = ov
+        self.rows = rows
+        self.orbs = list(orbs)
+        self.pos = {p: k for k, p in enumerate(self.orbs)}
+        self.nocc = nocc
+        self.shape = (ov.shape[0], nmo, nmo)
+
+    @property
+    def nbytes(self):
+        return self.ov.nbytes + self.rows.nbytes
+
+    def __getitem__(self, key):
+        if not (isinstance(key, tuple) and len(key) == 3 and key[0] == slice(None)):
+            raise IndexError('_WindowLpq supports Lpq[:, rows, cols] only')
+        _, r, c = key
+        o, n = self.nocc, self.shape[1]
+        if isinstance(r, slice):
+            r0, r1, sr = r.indices(n)
+            vir_cols = isinstance(c, slice) and c.indices(n) == (o, n, 1)
+            if sr == 1 and r1 <= o and vir_cols:
+                return self.ov[:, r0:r1]
+            rows = list(range(r0, r1, sr))
+        else:
+            rows = [int(p) for p in np.atleast_1d(r)]
+        try:
+            idx = [self.pos[p] for p in rows]
+        except KeyError:
+            raise IndexError('rows %s are not among the GW orbitals of _WindowLpq' % rows)
+        if idx == list(range(idx[0], idx[0] + len(idx))):
+            return self.rows[:, idx[0]:idx[0] + len(idx), c]
+        return self.rows[:, idx][:, :, c]
+
+
+def _transform_window(gw, mo_coeff, orbs):
+    '''_WindowLpq for the GW orbitals orbs (non-frozen indexing), from gw.with_df.'''
+    from pyscf.gw.bse_lowmem import transform_df_pairs
+    nocc = gw.nocc
+    nmo = mo_coeff.shape[1]
+    pairs = {'ov': (slice(0, nocc), slice(nocc, nmo)), 'rows': (list(orbs), slice(0, nmo))}
+    with temporary_env(gw.with_df, verbose=0), temporary_env(gw.mol, verbose=0):
+        blk = transform_df_pairs(gw.with_df, mo_coeff, pairs, gw.max_memory)
+    return _WindowLpq(blk['ov'], blk['rows'], orbs, nocc, nmo)
+
+
+def _df_outcore_if_large(gw, frac=0.3):
+    '''Store the AO DF tensor of gw.with_df on disk (lib.param.TMPDIR) if it would take more
+    than frac of the memory left under gw.max_memory and has not been built yet.'''
+    from pyscf import df
+    with_df = gw.with_df
+    if with_df._cderi is not None or isinstance(with_df._cderi_to_save, str):
+        return
+    mol = gw.mol
+    naux = df.addons.make_auxmol(mol, with_df.auxbasis).nao_nr()
+    nao = mol.nao_nr()
+    size_mb = naux * nao * (nao + 1) // 2 * 8 / 1e6
+    if size_mb > frac * (gw.max_memory - lib.current_memory()[0]):
+        # kept alive on the GW object; the file is removed when it is garbage collected
+        gw._cderi_tmpfile = lib.NamedTemporaryFile(dir=lib.param.TMPDIR)
+        with_df._cderi_to_save = gw._cderi_tmpfile.name
+        logger.info(gw, 'fsCD: AO DF tensor (%.0f MB) stored on disk in %s', size_mb,
+                    with_df._cderi_to_save)
+
+
 def _orbital_block(Lpq, orbs, cols):
     '''Lpq[:, orbs, cols] as a (naux, len(orbs) * ncols) matrix; a view (no copy) when orbs
     is a contiguous range and cols spans all orbitals.'''
@@ -368,13 +440,27 @@ def prepare(gw):
     nocc = gw.nocc
     set_frozen_orbs(gw)
     mo_coeff_frz = _mo_without_core(gw, gw.mo_coeff)
-    if gw.Lpq is None:
-        with temporary_env(gw.with_df, verbose=0), temporary_env(gw.mol, verbose=0):
-            gw.Lpq = gw.ao2mo(mo_coeff_frz)
-    Lpq = gw.Lpq
+    if gw.Lpq is None and gw.lowmem_ints:
+        # only the occupied-virtual block and the rows of the GW orbitals
+        _df_outcore_if_large(gw)
+        Lpq = _transform_window(gw, mo_coeff_frz, gw.orbs_frz)
+        logger.info(gw, 'fsCD: low-memory MO integrals (ov block + %d orbital rows), %.0f MB',
+                    len(gw.orbs_frz), Lpq.nbytes / 1e6)
+    else:
+        if gw.Lpq is None:
+            with temporary_env(gw.with_df, verbose=0), temporary_env(gw.mol, verbose=0):
+                gw.Lpq = gw.ao2mo(mo_coeff_frz)
+        Lpq = gw.Lpq
     with temporary_env(mf, verbose=0):
         gw.vxc = mo_coeff_frz.T @ (mf.get_veff() - mf.get_j()) @ mo_coeff_frz
-    if gw.vhf_df:
+    if gw.vhf_df and isinstance(Lpq, _WindowLpq):
+        # only the GW-orbital block of Sigma^x is needed (its diagonal enters the QP equation)
+        nmo = Lpq.shape[1]
+        rows_occ = Lpq.rows[:, :, :nocc]
+        win = np.asarray(gw.orbs_frz)
+        gw.vk = np.zeros((nmo, nmo))
+        gw.vk[win[:, None], win] = -einsum('Lpi,Lqi->pq', rows_occ, rows_occ)
+    elif gw.vhf_df:
         gw.vk = -einsum('Lpi,Liq->pq', Lpq[:, :, :nocc], Lpq[:, :nocc, :])
     else:
         gw.vk = gw.get_sigma_exchange(mo_coeff=mo_coeff_frz)
@@ -583,6 +669,13 @@ class GWFSCD(GWCD):
             solves the canonical-CD equation (fitted values are then only used along the way).
             Costs at most about one canonical-CD self-energy evaluation per orbital.  Default
             False (pure frequency sampling); EVGWFSCD enables it.
+        lowmem_ints : bool
+            Do not form the full MO DF tensor Lpq (naux, nmo, nmo).  Only the occupied-virtual
+            block (response function) and the rows of the orbitals in gw.orbs (self-energy) are
+            transformed, and the AO DF tensor is written to disk (lib.param.TMPDIR) when it
+            would take more than 30% of the memory left under max_memory.  gw.Lpq stays None.
+            Same results; requires that no other code needs gw.Lpq afterwards (QRBSE builds its
+            own integral blocks from gw.with_df).  Default False.
         qpe_scan_range, qpe_scan_step : float
             If Newton's method fails for the QP equation, the solution closest to the starting
             guess is bracketed on a grid of this half-width and step (a.u., default 0.5 and
@@ -602,6 +695,7 @@ class GWFSCD(GWCD):
         self.qpe_scan_range = 0.5     # fallback root bracketing: +-range around the guess (Ha)
         self.qpe_scan_step = 0.005    # and step of the scan (Ha)
         self.fs_polish = False
+        self.lowmem_ints = False
         self.real_freqs = None
         self._fs = None
         self._fs_ints = None

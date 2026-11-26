@@ -93,7 +93,16 @@ class QuadraticResponseBase(lib.StreamObject):
         conv_tol : float
             Relative residual tolerance of the iterative linear solver.
         max_cycle : int
-            Maximum number of GMRES iterations per right-hand side.
+            Maximum number of iterations of the iterative linear solver (per right-hand side
+            for GMRES).
+        linear_solver : str
+            Iterative solver for the response equations: 'block' (default) solves all
+            right-hand sides at one frequency together in a shared subspace (paired
+            X+Y / X-Y basis), so each iteration needs one batched matrix-vector product;
+            'gmres' runs scipy GMRES on each right-hand side separately.
+        max_subspace : int
+            Subspace size (per X+Y and X-Y basis) of the block linear solver before it
+            restarts from the current solutions.  Default 200.
         gauge_origin : 3-tuple
             Origin of the dipole operator.  Results for neutral molecules do not depend on it.
         max_dense_dim : int
@@ -117,6 +126,8 @@ class QuadraticResponseBase(lib.StreamObject):
         self.solver = 'iterative'
         self.conv_tol = 1e-9
         self.max_cycle = 300
+        self.linear_solver = 'block'
+        self.max_subspace = 200
         self.gauge_origin = (0.0, 0.0, 0.0)
         self.max_dense_dim = 3000
 
@@ -151,7 +162,8 @@ class QuadraticResponseBase(lib.StreamObject):
         log.info('nmo = %d  nocc = %d  nvir = %d', self.nmo, o, self.nmo - o)
         log.info('linear solver = %s', self.solver)
         if self.solver == 'iterative':
-            log.info('conv_tol = %g  max_cycle = %d', self.conv_tol, self.max_cycle)
+            log.info('iterative solver = %s  conv_tol = %g  max_cycle = %d',
+                     self.linear_solver, self.conv_tol, self.max_cycle)
         return self
 
     def _dump_method_flags(self, log):
@@ -194,6 +206,23 @@ class QuadraticResponseBase(lib.StreamObject):
         G = self.get_kernel(self._ovvo_to_full(X[None], Y[None])[0])
         d = self._orb_diff().reshape(X.shape)
         return (d - omega) * X + G[o:, :o].T, (d + omega) * Y + G[:o, o:]
+
+    def _apb_amb_batch(self, zp, zm):
+        '''(A+B) zp and (A-B) zm for stacks of vectors (np, dim) and (nm, dim).  Generic
+        version through _lr_matvec; methods with a batched contraction override it.'''
+        o = self.nocc
+        v = self.nmo - o
+        zp = np.asarray(zp).reshape(-1, o, v)
+        zm = np.asarray(zm).reshape(-1, o, v)
+        apb = np.empty((zp.shape[0], o * v))
+        amb = np.empty((zm.shape[0], o * v))
+        for k, z in enumerate(zp):
+            ax, ay = self._lr_matvec(0.0, 0.5 * z, 0.5 * z)
+            apb[k] = (ax + ay).ravel()
+        for k, z in enumerate(zm):
+            ax, ay = self._lr_matvec(0.0, 0.5 * z, -0.5 * z)
+            amb[k] = (ax - ay).ravel()
+        return apb, amb
 
     def get_dense_apb_amb(self):
         '''Dense A+B and A-B matrices (dimension nocc*nvir), built from get_kernel.'''
@@ -314,6 +343,119 @@ class QuadraticResponseBase(lib.StreamObject):
         return ((zp + zm) * 0.5).reshape(nrhs, o, v), ((zp - zm) * 0.5).reshape(nrhs, o, v)
 
     def _solve_iterative(self, omega, r_ai, r_ia):
+        if self.linear_solver == 'gmres':
+            return self._solve_gmres(omega, r_ai, r_ia)
+        if self.linear_solver == 'block':
+            return self._solve_block(omega, r_ai, r_ia)
+        raise ValueError('Unknown linear_solver %s' % self.linear_solver)
+
+    def _solve_block(self, omega, r_ai, r_ia):
+        '''Subspace solver for all right-hand sides at once, in zp = X + Y and zm = X - Y:
+
+            (A+B) zp - w zm = bp = -(r_ai + r_ia),   (A-B) zm - w zp = bm = -(r_ai - r_ia).
+
+        zp and zm are expanded in separate orthonormal bases Vp, Vm (the paired basis of
+        response solvers such as VeloxChem's); the projected equations are solved exactly
+        and the diagonally preconditioned residuals of the unconverged right-hand sides
+        extend the bases.  Each iteration costs one batched product (A+B) Vp_new,
+        (A-B) Vm_new.  When a basis exceeds max_subspace it is collapsed onto the current
+        solutions (no new products needed).  Convergence: relative residual norm
+        |r| / |b| < conv_tol for every right-hand side.'''
+        log = logger.new_logger(self)
+        nrhs, o, v = r_ai.shape
+        dim = o * v
+        d = self._orb_diff()
+        den = d * d - omega * omega
+        if np.any(np.abs(den) < 1e-12):
+            raise ValueError('Frequency %g coincides with an orbital-energy difference.' % omega)
+        bp = -(r_ai + r_ia).reshape(nrhs, dim)
+        bm = -(r_ai - r_ia).reshape(nrhs, dim)
+        bnorm = np.sqrt(np.einsum('nk,nk->n', bp, bp) + np.einsum('nk,nk->n', bm, bm))
+        X = np.zeros((nrhs, o, v))
+        Y = np.zeros((nrhs, o, v))
+        live = np.flatnonzero(bnorm >= 1e-14)
+        if live.size == 0:
+            return X, Y
+        bp, bm, bnorm = bp[live], bm[live], bnorm[live]
+
+        def precond(rp, rm):
+            # inverse of [[d, -w], [-w, d]] applied to (rp, rm)
+            return (d * rp + omega * rm) / den, (d * rm + omega * rp) / den
+
+        def extend(V, S, new):
+            '''Orthonormalize new rows against V and among themselves.'''
+            for _ in range(2):
+                if V.shape[0]:
+                    new = new - (new @ V.T) @ V
+            out = []
+            for t in new:
+                for _ in range(2):
+                    for u in out:
+                        t = t - np.dot(u, t) * u
+                nt = np.linalg.norm(t)
+                if nt > 1e-10:
+                    out.append(t / nt)
+            return np.asarray(out).reshape(-1, dim)
+
+        Vp = np.zeros((0, dim))
+        Vm = np.zeros((0, dim))
+        Sp = np.zeros((0, dim))
+        Sm = np.zeros((0, dim))
+        tp, tm = precond(bp, bm)
+        conv = np.zeros(live.size, dtype=bool)
+        res = np.full(live.size, np.inf)
+        zp = np.zeros_like(bp)
+        zm = np.zeros_like(bm)
+        for icyc in range(self.max_cycle):
+            newp = extend(Vp, Sp, tp)
+            newm = extend(Vm, Sm, tm)
+            if newp.shape[0] == 0 and newm.shape[0] == 0:
+                log.warn('%s block linear solver: no new directions at w = %g (relative '
+                         'residuals %s)', self._label, omega, res)
+                break
+            ap, am = self._apb_amb_batch(newp, newm)
+            Vp = np.vstack([Vp, newp])
+            Sp = np.vstack([Sp, ap])
+            Vm = np.vstack([Vm, newm])
+            Sm = np.vstack([Sm, am])
+            kp, km = Vp.shape[0], Vm.shape[0]
+            # projected equations [[Vp (A+B) Vp, -w Vp Vm], [-w Vm Vp, Vm (A-B) Vm]] c = [Vp bp, Vm bm]
+            H = np.empty((kp + km, kp + km))
+            H[:kp, :kp] = 0.5 * (Vp @ Sp.T + Sp @ Vp.T)
+            H[kp:, kp:] = 0.5 * (Vm @ Sm.T + Sm @ Vm.T)
+            C = Vp @ Vm.T
+            H[:kp, kp:] = -omega * C
+            H[kp:, :kp] = -omega * C.T
+            rhs = np.hstack([bp @ Vp.T, bm @ Vm.T])
+            c = np.linalg.solve(H, rhs.T).T
+            xs, ys = c[:, :kp], c[:, kp:]
+            zp = xs @ Vp
+            zm = ys @ Vm
+            rp = xs @ Sp - omega * zm - bp
+            rm = ys @ Sm - omega * zp - bm
+            res = np.sqrt(np.einsum('nk,nk->n', rp, rp) + np.einsum('nk,nk->n', rm, rm)) / bnorm
+            conv = res < self.conv_tol
+            log.debug('%s block linear solver w = %g  cycle %d  subspace %d+%d  max rel. residual %.3e',
+                      self._label, omega, icyc + 1, kp, km, res.max())
+            if conv.all():
+                break
+            tp, tm = precond(rp[~conv], rm[~conv])
+            if kp + tp.shape[0] > self.max_subspace or km + tm.shape[0] > self.max_subspace:
+                # collapse onto the current solutions (products follow from the same coefficients)
+                qp = scipy.linalg.qr(xs.T, mode='economic')[0]
+                qm = scipy.linalg.qr(ys.T, mode='economic')[0]
+                Vp, Sp = qp.T @ Vp, qp.T @ Sp
+                Vm, Sm = qm.T @ Vm, qm.T @ Sm
+                log.debug('%s block linear solver: subspace collapsed to %d+%d',
+                          self._label, Vp.shape[0], Vm.shape[0])
+        if not conv.all():
+            log.warn('%s block linear solver not converged at w = %g: relative residuals %s',
+                     self._label, omega, res)
+        X[live] = (0.5 * (zp + zm)).reshape(-1, o, v)
+        Y[live] = (0.5 * (zp - zm)).reshape(-1, o, v)
+        return X, Y
+
+    def _solve_gmres(self, omega, r_ai, r_ia):
         log = logger.new_logger(self)
         nrhs, o, v = r_ai.shape
         dim = o * v

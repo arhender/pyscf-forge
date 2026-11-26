@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import unittest
 import numpy as np
 from pyscf import gto, scf, dft
@@ -134,41 +135,64 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(errs[0] / errs[1], 10, 0)
         self.assertTrue(np.all(delta['linear'] >= 0))
 
-    def test_davidson_sizing_scales_with_nstates(self):
-        # BSE.__init__ sizes the Davidson space from its default nroot = 10; the iterative
-        # excited-state path must enlarge it with nstates and never shrink user settings.
-        qr = QRBSE(gw)
-        bse = qr._bse
-        full_dim = qr.nocc * (qr.nmo - qr.nocc)
-        bse.max_vec = 50
-        qr._size_davidson(bse, 6)
-        self.assertEqual(bse.init_ntri, min(full_dim, 4 * 6))
-        self.assertEqual(bse.max_expand, 10)
-        self.assertGreaterEqual(bse.max_vec, 50)
-        self.assertLessEqual(bse.max_vec, full_dim + 2 * bse.max_expand)
-        self.assertGreaterEqual(bse.max_vec, bse.init_ntri + 2 * 6)
-
-        qr.davidson_init_per_root = 1
-        qr.davidson_space_per_root = 1
-        bse.init_ntri = 30
-        bse.max_vec = 55
-        qr._size_davidson(bse, 3)
-        self.assertEqual(bse.init_ntri, 30)
-        self.assertEqual(bse.max_vec, 55)
-
     def test_iterative_excited_states(self):
         qr = QRBSE(gw)
         qr.solver = 'direct'
-        e_dir = qr.get_excited_states(5)[0]
+        e_dir, X_dir, Y_dir = qr.get_excited_states(5)
         qr = QRBSE(gw)
         qr.max_dense_dim = 0
+        qr.davidson_conv_tol = 1e-8
         exci, X, Y = qr.get_excited_states(5)
         self.assertEqual(exci.shape, (5,))
         self.assertEqual(X.shape[0], 5)
-        self.assertAlmostEqual(abs(exci - e_dir).max(), 0, 7)
-        # the Davidson solver tracks davidson_extra_roots roots above the requested ones
-        self.assertEqual(qr._bse.nroot, 5 + qr.davidson_extra_roots)
-        self.assertGreaterEqual(qr._bse.init_ntri, 4 * 7)
+        self.assertAlmostEqual(abs(exci - e_dir).max(), 0, 9)
+        # same eigenvectors up to sign
+        ov = np.einsum('nia,nia->n', X, X_dir) - np.einsum('nia,nia->n', Y, Y_dir)
+        self.assertAlmostEqual(abs(abs(ov) - 1).max(), 0, 6)
+
+    def test_block_linear_solver_vs_gmres(self):
+        qr = QRBSE(gw)
+        qr.linear_solver = 'gmres'
+        a_g = qr.polarizability(0.1)
+        b_g = qr.hyperpolarizability(0.03, 0.05)
+        qr = QRBSE(gw)
+        qr.linear_solver = 'block'
+        a_b = qr.polarizability(0.1)
+        b_b = qr.hyperpolarizability(0.03, 0.05)
+        self.assertAlmostEqual(abs(a_g - a_b).max(), 0, 7)
+        self.assertAlmostEqual(abs(b_g - b_b).max(), 0, 6)
+        # tiny subspace: the solver collapses and restarts but reaches the same solution
+        qr = QRBSE(gw)
+        qr.max_subspace = 8
+        self.assertAlmostEqual(abs(qr.polarizability(0.1) - a_g).max(), 0, 7)
+
+    def test_outcore_integral_blocks(self):
+        # integrals transformed from the DF object straight to disk (no full Lpq) give the
+        # same responses as views of the GW object's full tensor
+        ref = QRBSE(gw)
+        g2 = copy.copy(gw)
+        g2.Lpq = None
+        for incore in (False, None):
+            qr = QRBSE(g2, incore=incore)
+            self.assertAlmostEqual(abs(qr.Lpq - ref.Lpq).max(), 0, 12)
+            self.assertAlmostEqual(abs(qr.polarizability(0.1) - ref.polarizability(0.1)).max(), 0, 9)
+            # bare and screened oo/ov/vv blocks all on disk, or (small system) all in memory
+            self.assertEqual(len(qr._store.ondisk()), 6 if incore is False else 0)
+            self.assertAlmostEqual(abs(qr.hyperpolarizability(0.03, 0.05)
+                                       - ref.hyperpolarizability(0.03, 0.05)).max(), 0, 8)
+            qr.solver = ref.solver = 'direct'
+            e1, T1, d1 = qr.two_photon_absorption(nstates=3)
+            e0, T0, d0 = ref.two_photon_absorption(nstates=3)
+            self.assertAlmostEqual(abs(e1 - e0).max(), 0, 10)
+            self.assertAlmostEqual(abs(d1['linear'] - d0['linear']).max(), 0, 6)
+            ref.solver = 'iterative'
+        # iterative excited states and 2PA entirely from disk
+        qr = QRBSE(g2, incore=False)
+        qr.max_dense_dim = 0
+        qr.davidson_conv_tol = 1e-8
+        e1, T1, d1 = qr.two_photon_absorption(nstates=3)
+        self.assertAlmostEqual(abs(e1 - e0).max(), 0, 8)
+        self.assertAlmostEqual(abs(d1['linear'] - d0['linear']).max() / abs(d0['linear']).max(), 0, 5)
 
     def test_beta_parallel_regression(self):
         qr = QRBSE(gw)
