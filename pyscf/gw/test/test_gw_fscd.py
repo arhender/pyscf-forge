@@ -49,6 +49,41 @@ class KnownValues(unittest.TestCase):
         zj, fj, _ = fit
         self.assertEqual(gw_fscd.aaa_eval(*fit, zj[0] + 1e-7), fj[0])
 
+    def test_aaa_bad_samples(self):
+        # a NaN sample and a repeated sample point are dropped (with a warning) instead of
+        # making the Loewner matrix non-finite; the fit is unchanged
+        poles = np.array([0.4 - 1e-3j, 0.9 - 1e-3j, 2.5 - 1e-3j])
+        res = np.array([0.3, -0.2, 0.5])
+        f = lambda z: np.sum(res / (z[:, None] - poles), axis=1)
+        z = np.concatenate([1j * np.linspace(0.01, 20, 40), np.array([0.0, 0.3, 1.2, 3.0])])
+        fz = f(z)
+        z_bad = np.concatenate([z, [1.2, 0.7]])
+        f_bad = np.concatenate([fz, [fz[-2], np.nan]])
+        with self.assertWarns(RuntimeWarning):
+            fit_bad = gw_fscd.aaa_fit(z_bad, f_bad)
+        fit = gw_fscd.aaa_fit(z, fz)
+        x = np.array([0.1, 0.55, 1.7, 2.2, 4.0])
+        a = np.array([gw_fscd.aaa_eval(*fit_bad, xi) for xi in x])
+        b = np.array([gw_fscd.aaa_eval(*fit, xi) for xi in x])
+        self.assertAlmostEqual(abs(a - b).max(), 0, 10)
+
+    def test_min_right_singular_vector_fallback(self):
+        # the gesvd fallback gives the same null vector as gesdd
+        rng = np.random.default_rng(0)
+        A = rng.standard_normal((12, 5)) + 1j * rng.standard_normal((12, 5))
+        v_ref = gw_fscd._min_right_singular_vector(A)
+        orig = np.linalg.svd
+        def failing_svd(*args, **kwargs):
+            raise np.linalg.LinAlgError('SVD did not converge')
+        np.linalg.svd = failing_svd
+        try:
+            with self.assertWarns(RuntimeWarning):
+                v = gw_fscd._min_right_singular_vector(A)
+        finally:
+            np.linalg.svd = orig
+        # singular vectors are defined up to a phase
+        self.assertAlmostEqual(abs(abs(np.vdot(v, v_ref)) - 1), 0, 10)
+
     def test_real_grid(self):
         cand = [18.70, 18.72, 18.80, 19.18, 19.20, 0.02, 0.5, 0.53]
         grid = gw_fscd.build_real_grid(cand, t1=0.05, t2=1e-3)

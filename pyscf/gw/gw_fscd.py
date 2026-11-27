@@ -69,6 +69,7 @@ Implementation notes:
 '''
 
 import time
+import warnings
 import numpy as np
 import scipy.linalg as sla
 from scipy.optimize import newton, brentq
@@ -92,10 +93,23 @@ def aaa_fit(z, f, rtol=1e-13, max_terms=100):
     Support points are added greedily at the sample with the largest error; the weights solve
     min ||A w|| subject to ||w|| = 1 for the Loewner matrix A of the remaining samples (SVD).
 
+    Non-finite samples and repeated sample points (which would make the Loewner matrix
+    infinite) are dropped with a warning before fitting.
+
     Returns (zj, fj, wj) for r(x) = sum_j wj fj / (x - zj) / sum_j wj / (x - zj).
     '''
     z = np.asarray(z, dtype=complex)
     f = np.asarray(f, dtype=complex)
+    keep = np.isfinite(z) & np.isfinite(f)
+    _, first = np.unique(z[keep], return_index=True)
+    idx = np.flatnonzero(keep)[np.sort(first)]
+    if idx.size < z.size:
+        warnings.warn('aaa_fit: dropped %d non-finite and %d repeated samples of %d'
+                      % (z.size - np.count_nonzero(keep), np.count_nonzero(keep) - idx.size,
+                         z.size), RuntimeWarning)
+        if idx.size == 0:
+            raise ValueError('aaa_fit: no finite samples')
+        z, f = z[idx], f[idx]
     M = z.size
     max_terms = min(max_terms, M)
     scale = np.abs(f).max()
@@ -116,12 +130,26 @@ def aaa_fit(z, f, rtol=1e-13, max_terms=100):
         C = 1.0 / (z[mask, None] - zj[None, :])
         A = (f[mask, None] - fj[None, :]) * C
         # right singular vector of the smallest singular value (full V if A is wide)
-        wj = np.linalg.svd(A, full_matrices=A.shape[0] < A.shape[1])[2][-1].conj()
+        wj = _min_right_singular_vector(A)
         r = f.copy()
         r[mask] = (C @ (wj * fj)) / (C @ wj)
         if np.abs(f - r).max() <= rtol * scale:
             break
     return z[support], f[support], wj
+
+
+def _min_right_singular_vector(A):
+    '''Right singular vector of the smallest singular value of A (full V if A is wide).
+    LAPACK's divide-and-conquer SVD (gesdd, numpy's default) occasionally fails to converge
+    for ill-conditioned Loewner matrices; fall back to the slower but more robust gesvd.'''
+    full = A.shape[0] < A.shape[1]
+    try:
+        vh = np.linalg.svd(A, full_matrices=full)[2]
+    except np.linalg.LinAlgError:
+        warnings.warn('aaa_fit: gesdd SVD did not converge for a %dx%d Loewner matrix; '
+                      'retrying with gesvd' % A.shape, RuntimeWarning)
+        vh = sla.svd(A, full_matrices=full, lapack_driver='gesvd')[2]
+    return vh[-1].conj()
 
 
 def aaa_eval(zj, fj, wj, x, tol=5e-6):
