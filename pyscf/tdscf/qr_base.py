@@ -209,19 +209,24 @@ class QuadraticResponseBase(lib.StreamObject):
 
     def _apb_amb_batch(self, zp, zm):
         '''(A+B) zp and (A-B) zm for stacks of vectors (np, dim) and (nm, dim).  Generic
-        version through _lr_matvec; methods with a batched contraction override it.'''
+        version: one batched get_kernel call for all vectors (X = Y = zp/2 gives
+        (A-w)X + BY + BX + (A+w)Y = (A+B) zp at w = 0; X = -Y = zm/2 gives (A-B) zm).  Methods
+        with a cheaper occupied-virtual contraction override it.'''
         o = self.nocc
         v = self.nmo - o
-        zp = np.asarray(zp).reshape(-1, o, v)
-        zm = np.asarray(zm).reshape(-1, o, v)
-        apb = np.empty((zp.shape[0], o * v))
-        amb = np.empty((zm.shape[0], o * v))
-        for k, z in enumerate(zp):
-            ax, ay = self._lr_matvec(0.0, 0.5 * z, 0.5 * z)
-            apb[k] = (ax + ay).ravel()
-        for k, z in enumerate(zm):
-            ax, ay = self._lr_matvec(0.0, 0.5 * z, -0.5 * z)
-            amb[k] = (ax - ay).ravel()
+        zp = np.asarray(zp, dtype=float).reshape(-1, o, v)
+        zm = np.asarray(zm, dtype=float).reshape(-1, o, v)
+        npl, nmi = zp.shape[0], zm.shape[0]
+        if npl + nmi == 0:
+            return np.zeros((0, o * v)), np.zeros((0, o * v))
+        X = np.concatenate([0.5 * zp, 0.5 * zm])
+        Y = np.concatenate([0.5 * zp, -0.5 * zm])
+        G = np.asarray(self.get_kernel(self._ovvo_to_full(X, Y))).reshape(npl + nmi, self.nmo, self.nmo)
+        d = self._orb_diff().reshape(o, v)
+        ax = d * X + G[:, o:, :o].transpose(0, 2, 1)
+        ay = d * Y + G[:, :o, o:]
+        apb = (ax[:npl] + ay[:npl]).reshape(npl, o * v)
+        amb = (ax[npl:] - ay[npl:]).reshape(nmi, o * v)
         return apb, amb
 
     def get_dense_apb_amb(self):

@@ -190,14 +190,22 @@ class TDDFTQuadraticResponse(QuadraticResponseBase):
             return self.get_third_kernel(Db, Dc, Dd)
         return None
 
+    # roots above nstates that the iterative excited-state solver also converges (buffer
+    # against weakly coupled states entering late, as in BSEQuadraticResponse)
+    davidson_extra_roots = 2
+
     def _excited_states_large(self, nstates):
         td = self._scf.TDDFT() if self.is_dft else self._scf.TDHF()
-        td.nstates = nstates
+        dim = self.nocc * (self.nmo - self.nocc)
+        td.nstates = min(dim, nstates + max(0, int(self.davidson_extra_roots)))
         td.conv_tol = min(td.conv_tol, 1e-9)
         td.kernel()
-        X = np.array([xy[0].ravel() for xy in td.xy])
-        Y = np.array([xy[1].ravel() for xy in td.xy])
-        return td.e, X, Y
+        conv = np.atleast_1d(td.converged)
+        if len(td.e) < nstates or not np.all(conv[:nstates]):
+            raise RuntimeError('%s excited states not converged (converged: %s)' % (self._label, conv))
+        X = np.array([xy[0].ravel() for xy in td.xy])[:nstates]
+        Y = np.array([xy[1].ravel() for xy in td.xy])[:nstates]
+        return np.asarray(td.e)[:nstates], X, Y
 
 
 QRTDDFT = TDDFTQuadraticResponse
