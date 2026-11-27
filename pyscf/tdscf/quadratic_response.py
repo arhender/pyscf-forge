@@ -60,6 +60,14 @@ class TDDFTQuadraticResponse(QuadraticResponseBase):
             Include the exchange-correlation hyperkernel g_xc (third functional derivative) and,
             in cubic response, the third-order kernel h_xc (fourth functional derivative).
             Required for consistency with finite-field derivatives.  Default True.
+        davidson_extra_roots : int
+            Number of roots above nstates that the iterative excited-state solver (used when
+            nocc*nvir > max_dense_dim) also converges and then discards.  Default 2.
+        davidson_conv_tol : float
+            Residual-norm threshold of the iterative excited-state solver
+            (tol_residual of pyscf.tdscf._lr_eig).  Default 1e-5, as in BSEQuadraticResponse.
+        davidson_max_cycle : int
+            Maximum iterations of the iterative excited-state solver.  Default 100.
     '''
 
     _label = 'TDDFT'
@@ -193,12 +201,15 @@ class TDDFTQuadraticResponse(QuadraticResponseBase):
     # roots above nstates that the iterative excited-state solver also converges (buffer
     # against weakly coupled states entering late, as in BSEQuadraticResponse)
     davidson_extra_roots = 2
+    davidson_conv_tol = 1e-5
+    davidson_max_cycle = 100
 
     def _excited_states_large(self, nstates):
         td = self._scf.TDDFT() if self.is_dft else self._scf.TDHF()
         dim = self.nocc * (self.nmo - self.nocc)
         td.nstates = min(dim, nstates + max(0, int(self.davidson_extra_roots)))
-        td.conv_tol = min(td.conv_tol, 1e-9)
+        td.conv_tol = self.davidson_conv_tol
+        td.max_cycle = self.davidson_max_cycle
         td.kernel()
         conv = np.atleast_1d(td.converged)
         if len(td.e) < nstates or not np.all(conv[:nstates]):
