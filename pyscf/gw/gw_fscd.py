@@ -452,7 +452,8 @@ def prepare(gw):
                 gw.Lpq = gw.ao2mo(mo_coeff_frz)
         Lpq = gw.Lpq
     with temporary_env(mf, verbose=0):
-        gw.vxc = mo_coeff_frz.T @ (mf.get_veff() - mf.get_j()) @ mo_coeff_frz
+        dm0 = mf.make_rdm1()
+        gw.vxc = mo_coeff_frz.T @ (mf.get_veff(dm=dm0) - mf.get_j(dm=dm0)) @ mo_coeff_frz
     if gw.vhf_df and isinstance(Lpq, _WindowLpq):
         # only the GW-orbital block of Sigma^x is needed (its diagonal enters the QP equation)
         nmo = Lpq.shape[1]

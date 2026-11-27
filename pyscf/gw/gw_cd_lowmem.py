@@ -128,7 +128,8 @@ def kernel(gw, load_chk=None):
             g.create_dataset('conv_inds', data=conv_inds)
 
     with temporary_env(mf, verbose=0):
-        v_mf = mo_coeff_frz.T @ (mf.get_veff() - mf.get_j()) @ mo_coeff_frz
+        dm0 = mf.make_rdm1()
+        v_mf = mo_coeff_frz.T @ (mf.get_veff(dm=dm0) - mf.get_j(dm=dm0)) @ mo_coeff_frz
     gw.vxc = v_mf
     if gw.vhf_df:
         vk = -einsum('Lpi,Liq->pq', Lpq[:, :, :nocc], Lpq[:, :nocc, :])

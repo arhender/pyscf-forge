@@ -29,7 +29,10 @@ Same algorithm and results as pyscf.gw.evgw.EVGW (to rounding), with
     from in-core four-index ERIs;
   * a fix for a preset gw.Lpq (pyscf.gw.evgw.kernel only binds its local Lpq when it
     transforms the integrals itself, so a GW object with Lpq already set fails with a
-    NameError in the in-core path).
+    NameError in the in-core path);
+  * the static Hamiltonian of the QP equation built by the overridable method get_ham_hf,
+    which also keeps the ground-state solvent potential of references with a solvent model
+    (the mean field keeps it out of hcore, so pyscf.gw.evgw drops it); see pyscf.gw.pcm_gw.
 '''
 
 import time
@@ -63,19 +66,7 @@ def kernel(gw):
             gw.Lpq = gw.ao2mo(mo_coeff_frz)      # may switch gw.outcore on instead
     Lpq = None if gw.outcore else gw.Lpq
 
-    hcore = mo_coeff_frz.T @ mf.get_hcore() @ mo_coeff_frz
-    if gw.vhf_df is False or Lpq is None:
-        if gw.vhf_df:
-            logger.warn(gw, 'vhf_df needs the in-core MO integrals; using conventional J/K')
-        veff, vj = hf_veff_j(gw, mf.make_rdm1())
-        vjk = mo_coeff_frz.T @ veff @ mo_coeff_frz
-        vk = vjk - mo_coeff_frz.T @ vj @ mo_coeff_frz
-    else:
-        vj = 2.0 * einsum('Lii,Lpq->pq', Lpq[:, :nocc, :nocc], Lpq)
-        vk = -einsum('Lpi,Liq->pq', Lpq[:, :, :nocc], Lpq[:, :nocc, :])
-        vjk = vj + vk
-    gw.vk = vk
-    ham_hf = hcore + vjk
+    ham_hf, gw.vk = gw.get_ham_hf(mo_coeff_frz, Lpq)
 
     gw_diis = diis.DIIS(gw, gw.diis_file)
     gw_diis.space = gw.diis_space
@@ -144,6 +135,33 @@ class EVGWLowMem(EVGW):
 
     ao2mo = GWACLowMem.ao2mo
     get_sigma_exchange = GWACLowMem.get_sigma_exchange
+
+    def get_ham_hf(self, mo_coeff, Lpq=None):
+        '''Static part of the QP equation, hcore + J - K/2 (MO basis), and the exchange
+        self-energy -K/2.  J and K come from Lpq if vhf_df is set and Lpq is in core,
+        otherwise from conventional integrals.  For a reference with a solvent model the
+        ground-state solvent potential (which the mean field keeps out of hcore) is added.'''
+        mf = self._scf
+        nocc = self.nocc
+        hcore = mo_coeff.T @ mf.get_hcore() @ mo_coeff
+        if self.vhf_df is False or Lpq is None:
+            if self.vhf_df:
+                logger.warn(self, 'vhf_df needs the in-core MO integrals; using conventional J/K')
+            veff, vj = hf_veff_j(self, mf.make_rdm1())
+            vjk = mo_coeff.T @ veff @ mo_coeff
+            vk = vjk - mo_coeff.T @ vj @ mo_coeff
+        else:
+            vj = 2.0 * einsum('Lii,Lpq->pq', Lpq[:, :nocc, :nocc], Lpq)
+            vk = -einsum('Lpi,Liq->pq', Lpq[:, :, :nocc], Lpq[:, :nocc, :])
+            vjk = vj + vk
+        ham_hf = hcore + vjk
+        solvent = getattr(mf, 'with_solvent', None)
+        if solvent is not None:
+            v_solvent = getattr(solvent, 'v', None)
+            if v_solvent is None:
+                v_solvent = solvent.kernel(mf.make_rdm1())[1]
+            ham_hf += mo_coeff.T @ v_solvent @ mo_coeff
+        return ham_hf, vk
 
     def kernel(self):
         '''Run an eigenvalue-self-consistent GW calculation.'''
